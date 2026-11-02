@@ -50,6 +50,15 @@ namespaces, close }`; `close` closes the connections, waits for the pending save
 - **Logging.** Through the `@punyts/core` reporter (categories `statenet` and `state-sync`): namespaces, revisions and
   errors, never change values.
 
+## With an app server
+
+An app server (Full mode) connects as a client without an `Origin` and keeps its own authority with the server logic.
+It loads each namespace from the statenet on start and relays every change its authority accepts, with the change ids,
+so a change resent after a reconnect is applied once. `$.server` is relayed encrypted as `$.sealed`: the statenet,
+like every authority, refuses client changes to `$.server`, and it cannot read the ciphertext. `@punyts/stateui-mcp`
+does this with `--statenet ws://127.0.0.1:4200/sync`; its Persisted apps connect their pages here directly, so start
+the statenet with `--allow-origin` set to the origin of those pages.
+
 ## Security
 
 - **Loopback only.** The statenet has no authentication, so it refuses to start on an address that is not loopback

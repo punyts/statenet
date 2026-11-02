@@ -8,4 +8,5 @@
 - `createFileNamespaceStorage`: one folder per namespace with `namespace.json`, written atomically, one writer at a
   time per namespace; temporary files a crash left are removed on load.
 - Listens on loopback only; refuses a non-loopback `Host` and browser origins that are not allowed.
+- README: how an app server relays to the statenet (`$.server` as `$.sealed`) and how Persisted pages are admitted.
 - Logs through the `@punyts/core` reporter, never change values.
