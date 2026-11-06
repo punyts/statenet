@@ -36,7 +36,7 @@
     "license": "MIT",
     "dependencies": {
         "@punyts/core": "^1.0.0",
-        "@punyts/state-sync": "^0.7.0",
+        "@punyts/state-sync": "^0.8.0",
         "ws": "^8.21.1"
     },
     "devDependencies": {
