@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Emit relay.** An `emit` from an app server (a client without `Origin`) is relayed to every other client of the
+  namespace, an `emit` from a web page to the app servers only; nothing of it is stored. `@punyts/stateui-mcp` sends
+  its view messages (documents, commands) this way and its pages their reports, app events and file requests.
+- **Leaving.** When a client of a namespace disconnects, the others get the emit `statenet.left` with its `{ clientId }`
+  (`LEFT_EMIT`).
+- README: how stateui-mcp uses the statenet; the stale `$.sealed` relay description is gone.
+
 ## 0.1.0
 
 - First version: `startStatenet` and the `statenet` CLI (`--port`, `--host`, `--data-dir`, `--log-length`,

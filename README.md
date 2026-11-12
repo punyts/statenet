@@ -19,7 +19,7 @@ npx statenet --data-dir ./data
 | `--log-length <n>` | `STATENET_LOG_LENGTH` | `1000` | Recent changes each namespace keeps for catching clients up |
 | `--allow-origin <url>` | `STATENET_ALLOW_ORIGINS` (comma-separated) | none | A browser origin that may connect; repeat for more |
 
-Clients connect to `ws://<host>:<port>/sync`. `GET /health` answers `{ "ok": true }`.
+Clients connect to `ws://<host>:<port>/sync`. `GET /health` answers `{ "ok": true }`. `npm start` runs `node dist/cli.js`.
 
 ## Use it from code
 
@@ -42,6 +42,12 @@ namespaces, close }`; `close` closes the connections, waits for the pending save
   time it is asked for, and one authority serves every client of it.
 - **Shape.** A namespace starts empty and the statenet creates missing parents of a change, since it does not know the
   app's shape.
+- **Emit relay.** The protocol's `emit` (a named event outside the state) is relayed between the clients of a
+  namespace and never stored: an emit from an app server (a client without `Origin`) goes to every other client of the
+  namespace, an emit from a web page to the app servers only, so one page cannot speak for the server to another. A
+  client that is not connected misses it.
+- **Leaving.** When a client of a namespace disconnects, the others get the emit `statenet.left` (`LEFT_EMIT`) with
+  `{ clientId }`, the id it gave in its `hello`, so an app server can forget a page that closed.
 - **Storage.** `createFileNamespaceStorage({ dataDir })` keeps one folder per namespace, named by the namespace, with
   `namespace.json` (state, revision, change log and applied change ids). A save writes a temporary file and renames it
   over the last one, so a crash leaves the last good file; the saves of one namespace run one at a time, in order, and
@@ -51,13 +57,13 @@ namespaces, close }`; `close` closes the connections, waits for the pending save
   errors, never change values.
 
 ## With an app server
-
-An app server (Full mode) connects as a client without an `Origin` and keeps its own authority with the server logic.
-It loads each namespace from the statenet on start and relays every change its authority accepts, with the change ids,
-so a change resent after a reconnect is applied once. `$.server` is relayed encrypted as `$.sealed`: the statenet,
-like every authority, refuses client changes to `$.server`, and it cannot read the ciphertext. `@punyts/stateui-mcp`
-does this with `--statenet ws://127.0.0.1:4200/sync`; its Persisted apps connect their pages here directly, so start
-the statenet with `--allow-origin` set to the origin of those pages.
+An app server connects as a client without an `Origin` and keeps its own authority with the server logic.
+`@punyts/stateui-mcp` does this: it serves no HTTP and writes every app's live state here, and its view pages (static
+files from Vite or a CDN) connect here directly, so start the statenet with `--allow-origin` set to the origin of
+those pages (`npm run dev` in stateui-mcp does). Per open app it bridges the namespace and its own authority both ways:
+the changes its authority makes (logic, tools) are written here, and a page's change, pushed to it like to any client,
+goes to its authority, which may put the value back. The document, commands, reports and files go over the emit relay.
+It keeps a directory of the apps in the namespace `stateui.apps`. `$.server` never leaves the app server.
 
 ## Security
 
@@ -68,4 +74,5 @@ the statenet with `--allow-origin` set to the origin of those pages.
 - **Origins.** A browser always sends `Origin` with a WebSocket. A connection with an `Origin` is accepted only when
   the origin is in `allowedOrigins`; clients without one (Node, app servers) are accepted. With no origins allowed, no
   web page can connect.
-- **`$.server`.** An app server relays `$.server` encrypted; the statenet stores the ciphertext and cannot read it.
+- **`$.server`.** The statenet, like every authority, refuses client changes to `$.server`; an app server keeps it to itself.
+- **Emits.** A web page's emits reach the app servers of its namespace only.

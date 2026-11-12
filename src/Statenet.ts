@@ -20,6 +20,16 @@ export const DEFAULT_LOG_LENGTH = 1000;
 const MAX_PENDING = 100;
 const KEEP_ALIVE_MS = 30_000;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+/** The emit the statenet sends a namespace when one of its clients leaves: `{ clientId }` */
+export const LEFT_EMIT = "statenet.left";
+
+/** A welcomed client of a namespace, for the emit relay */
+interface Member {
+    clientId: string;
+    /** No `Origin`: an app server, not a web page */
+    server: boolean;
+    send: (text: string) => void;
+}
 
 export interface StatenetOptions {
     /** A loopback address; anything else is refused. `127.0.0.1` by default */
@@ -82,10 +92,42 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         return authority;
     };
 
+    /** The welcomed clients of each namespace, for the emit relay */
+    const members = new Map<string, Set<Member>>();
+    /**
+     * The emit relay: an emit from an app server (no `Origin`) goes to every other client of the namespace, an emit
+     * from a web page to the app servers only. Nothing of it is kept: a client that is not connected misses it
+     */
+    const relayEmit = (namespace: string, from: Member, text: string): void => {
+        if (!text.includes('"emit"')) return;
+        const parsed = parseMessage(text);
+        if (!parsed.ok || parsed.message.type !== "emit") return;
+        const { name, value } = parsed.message;
+        const relayed = JSON.stringify(value === undefined ? { type: "emit", name } : { type: "emit", name, value });
+        for (const member of members.get(namespace) ?? []) {
+            if (member === from || (!from.server && !member.server)) continue;
+            member.send(relayed);
+        }
+    };
+    /** A client left: the others of its namespace are told, so an app server can forget a page that closed */
+    const leave = (namespace: string, member: Member): void => {
+        const joined = members.get(namespace);
+        if (joined === undefined || !joined.delete(member)) return;
+        if (joined.size === 0) {
+            members.delete(namespace);
+            return;
+        }
+        const notice = JSON.stringify({ type: "emit", name: LEFT_EMIT, value: { clientId: member.clientId } });
+        for (const other of joined) other.send(notice);
+    };
+
     const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
-    const onConnection = (ws: WebSocket): void => {
+    const onConnection = (ws: WebSocket, request: IncomingMessage): void => {
+        const server = request.headers.origin === undefined;
         let session: AuthoritySession | undefined;
+        let member: Member | undefined;
+        let joinedNamespace = "";
         let opening = false;
         let closed = false;
         const pending: string[] = [];
@@ -98,7 +140,11 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         ws.on("message", (data, isBinary) => {
             if (isBinary) return refuse("binary", "Text frames only", 1003);
             const text = textOf(data);
-            if (session !== undefined) return session.receive(text);
+            if (session !== undefined) {
+                session.receive(text);
+                if (member !== undefined) relayEmit(joinedNamespace, member, text);
+                return;
+            }
             if (opening) {
                 if (pending.length >= MAX_PENDING) return refuse("too-many", "Too many messages before the namespace loaded", 1008);
                 pending.push(text);
@@ -107,7 +153,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
             const parsed = parseMessage(text);
             if (!parsed.ok) return refuse(parsed.error.code, parsed.error.message, 1008);
             if (parsed.message.type !== "hello") return refuse("hello-first", "The first message must be hello", 1008);
-            const { namespace } = parsed.message;
+            const { namespace, clientId } = parsed.message;
             opening = true;
             authorityOf(namespace)
                 .then((authority) => {
@@ -120,7 +166,22 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
                     });
                     report("statenet", "A client joined %s", [namespace]);
                     session.receive(text);
-                    for (const message of pending.splice(0)) session.receive(message);
+                    const joining: Member = {
+                        clientId,
+                        server,
+                        send: (message) => {
+                            if (ws.readyState === ws.OPEN) ws.send(message);
+                        }
+                    };
+                    member = joining;
+                    joinedNamespace = namespace;
+                    let joined = members.get(namespace);
+                    if (joined === undefined) members.set(namespace, (joined = new Set()));
+                    joined.add(joining);
+                    for (const message of pending.splice(0)) {
+                        session.receive(message);
+                        relayEmit(namespace, joining, message);
+                    }
                 })
                 .catch((error: unknown) => {
                     report("statenet", "Could not load namespace %s: %s", [namespace, error instanceof Error ? error.message : String(error)]);
@@ -132,6 +193,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
             closed = true;
             clearInterval(timer);
             session?.close();
+            if (member !== undefined) leave(joinedNamespace, member);
         });
     };
 
@@ -163,7 +225,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         const path = (request.url ?? "/").split("?")[0];
         if (path !== SYNC_PATH) return refuseUpgrade(socket, 404, "Not Found");
         if (!isAllowed(request)) return refuseUpgrade(socket, 403, "Forbidden");
-        sockets.handleUpgrade(request, socket, head, onConnection);
+        sockets.handleUpgrade(request, socket, head, (ws) => onConnection(ws, request));
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -184,6 +246,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         close: async () => {
             const loaded = await Promise.all([...authorities.values()].map((authority) => authority.catch(() => undefined)));
             for (const authority of loaded) authority?.close();
+            members.clear();
             for (const client of sockets.clients) client.terminate();
             sockets.close();
             await Promise.all(loaded.map((authority) => authority?.flush()));

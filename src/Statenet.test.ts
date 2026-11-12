@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { addListener, removeListener, setCategories } from "@punyts/core";
 import { WebSocket } from "ws";
 import { NAMESPACE_FILE } from "./FileNamespaceStorage.js";
-import { startStatenet } from "./Statenet.js";
+import { LEFT_EMIT, startStatenet } from "./Statenet.js";
 import type { RunningStatenet } from "./Statenet.js";
 
 type Message = Record<string, unknown>;
@@ -172,6 +172,42 @@ describe("startStatenet", () => {
         expect(allowed.socket.readyState).toBe(WebSocket.OPEN);
     });
 
+    it("should relay an app server's emit to every other client and a page's emit to the app servers only", async () => {
+        // Arrange: an app server (no Origin) and two pages of an allowed origin in one namespace, and one elsewhere
+        const page = { Origin: "http://127.0.0.1:4100" };
+        const server = await open();
+        const first = await open(page);
+        const second = await open(page);
+        const elsewhere = await open();
+        await hello(server, "apps.orders", 0, "server");
+        await hello(first, "apps.orders", 0, "first");
+        await hello(second, "apps.orders", 0, "second");
+        await hello(elsewhere, "apps.other", 0, "elsewhere");
+        // Act
+        server.send({ type: "emit", name: "stateui.server", value: { text: "to the pages" } });
+        first.send({ type: "emit", name: "stateui.view", value: { text: "to the server" } });
+        const [toFirst, toSecond, toServer] = await Promise.all([
+            first.next((message) => message["type"] === "emit"),
+            second.next((message) => message["type"] === "emit"),
+            server.next((message) => message["type"] === "emit")
+        ]);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        // Assert
+        expect(toFirst).toEqual({ type: "emit", name: "stateui.server", value: { text: "to the pages" } });
+        expect(toSecond).toEqual(toFirst);
+        expect(toServer).toEqual({ type: "emit", name: "stateui.view", value: { text: "to the server" } });
+        expect(second.received.filter((message) => message["name"] === "stateui.view")).toEqual([]);
+        expect(elsewhere.received.filter((message) => message["type"] === "emit")).toEqual([]);
+    });
+    it("should tell a namespace when one of its clients leaves", async () => {
+        const server = await open();
+        const page = await open({ Origin: "http://127.0.0.1:4100" });
+        await hello(server, "apps.orders", 0, "server");
+        await hello(page, "apps.orders", 0, "page-view");
+        page.socket.close();
+        const left = await server.next((message) => message["type"] === "emit");
+        expect(left).toEqual({ type: "emit", name: LEFT_EMIT, value: { clientId: "page-view" } });
+    });
     it("should report namespaces and revisions but never change values", async () => {
         // Arrange
         const lines: string[] = [];
