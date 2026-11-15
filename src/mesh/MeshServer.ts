@@ -3,7 +3,7 @@ import type { Server as HttpServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import type { Change, RevisedChange } from '@punyts/state-sync';
-import type { Access, RelayBatch, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
+import type { Access, Authority, AuthoritySession, Handoff, RelayBatch, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import { checkProof, newNonce, proveNode, verifyNodeCertificate } from './certificates.js';
@@ -11,8 +11,11 @@ import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
 import type { DirectoryView, LinkMessage, MeshMessage } from './protocol.js';
 
-/** How a node takes a write from below: it orders it as the owner, or passes it up */
-export type MeshWriter = (address: string, change: Change, access?: Access) => Promise<WriteOutcome>;
+/** How a node takes a write from below: it orders it as the owner, or passes it up. `via` is the node it came from */
+export type MeshWriter = (address: string, change: Change, access?: Access, via?: string) => Promise<WriteOutcome>;
+
+/** What serves a tunnelled session: an authority, or anything that takes connections as one does */
+export type SessionEndpoint = Pick<Authority, 'connect'>;
 
 export interface MeshServerOptions {
     readonly nodeId: string;
@@ -26,6 +29,15 @@ export interface MeshServerOptions {
     readonly write: MeshWriter;
     /** The directory the nodes below learn; read when a link opens */
     readonly directory: () => DirectoryView;
+    /**
+     * The sessions of a namespace this node owns, for a peer that serves a view of it (an owner node of the same
+     * statenet): the endpoint, or why not (it is owned elsewhere now). Without it a peer cannot open sessions here
+     */
+    readonly sessions?: (address: string, access: Access | undefined, peer: string) => Promise<SessionEndpoint | string>;
+    /** The owner's side of a claim by the peer at the other end (`OwnerNode.handoff`) */
+    readonly handoff?: (address: string, to: string) => Promise<Handoff | undefined>;
+    /** The owner at the other end asks this node to claim a namespace (`OwnerNode.claim`) */
+    readonly take?: (address: string) => Promise<boolean>;
     readonly host?: string;
     /** 0 for any free port */
     readonly port?: number;
@@ -46,6 +58,12 @@ interface Link {
     readonly socket: WebSocket;
     readonly peer: NodeCertificateClaims;
     readonly served: Map<number, Served>;
+    /** The sessions tunnelled for the node below, by its tunnel id */
+    readonly tunnels: Map<number, AuthoritySession>;
+    /** Tunnels still being opened: what arrives for them meanwhile, and whether they were shut */
+    readonly opening: Map<number, { said: string[]; shut: boolean }>;
+    /** The writes of handoffs to the node below, waiting for their outcome, by `<cid>/<qid>` */
+    readonly handed: Map<string, (outcome: WriteOutcome) => void>;
     credit: number;
     outbox: MeshMessage[];
     scheduled: boolean;
@@ -183,8 +201,77 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                 link.credit += Math.max(0, Math.min(message.amount, 100_000));
                 release(link);
                 return;
+            case 'open': {
+                const tid = message.tid;
+                const pending = { said: [] as string[], shut: false };
+                link.opening.set(tid, pending);
+                const endpoint = options.sessions === undefined ? 'this node serves no sessions' : await options.sessions(message.address, message.access, link.peer.nodeId).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+                link.opening.delete(tid);
+                if (typeof endpoint === 'string') {
+                    if (!pending.shut) queue(link, { type: 'shut', tid, reason: endpoint });
+                    return;
+                }
+                if (!links.has(link) || pending.shut) return;
+                let open = true;
+                const session = endpoint.connect(
+                    {
+                        send: (text) => {
+                            if (open) queue(link, { type: 'say', tid, text });
+                        },
+                        close: () => {
+                            if (!open) return;
+                            open = false;
+                            link.tunnels.delete(tid);
+                            queue(link, { type: 'shut', tid, reason: 'closed' });
+                        }
+                    },
+                    message.access
+                );
+                if (open) link.tunnels.set(tid, session);
+                for (const text of pending.said) if (open) session.receive(text);
+                return;
+            }
+            case 'say': {
+                const pending = link.opening.get(message.tid);
+                if (pending !== undefined) pending.said.push(message.text);
+                else link.tunnels.get(message.tid)?.receive(message.text);
+                return;
+            }
+            case 'shut': {
+                const pending = link.opening.get(message.tid);
+                if (pending !== undefined) pending.shut = true;
+                const session = link.tunnels.get(message.tid);
+                link.tunnels.delete(message.tid);
+                session?.close();
+                return;
+            }
+            case 'claim': {
+                const handoff = await options.handoff?.(message.address, link.peer.nodeId).catch(() => undefined);
+                if (handoff === undefined) {
+                    queue(link, { type: 'handoff', cid: message.cid });
+                    return;
+                }
+                const queued = handoff.queued.map((item, qid) => {
+                    link.handed.set(`${message.cid}/${qid}`, item.done);
+                    return { qid, change: item.change };
+                });
+                queue(link, { type: 'handoff', cid: message.cid, handoff: { revision: handoff.revision, epoch: handoff.epoch, queued } });
+                return;
+            }
+            case 'handed': {
+                const key = `${message.cid}/${message.qid}`;
+                const done = link.handed.get(key);
+                link.handed.delete(key);
+                done?.(message.outcome);
+                return;
+            }
+            case 'take': {
+                const ok = (await options.take?.(message.address).catch(() => false)) ?? false;
+                queue(link, { type: 'taken', cid: message.cid, ok });
+                return;
+            }
             case 'write': {
-                const outcome = await options.write(message.address, message.change, message.access).catch((error: unknown): WriteOutcome => ({ result: 'rejected', reason: error instanceof Error ? error.message : String(error) }));
+                const outcome = await options.write(message.address, message.change, message.access, link.peer.nodeId).catch((error: unknown): WriteOutcome => ({ result: 'rejected', reason: error instanceof Error ? error.message : String(error) }));
                 queue(link, { type: 'written', wid: message.wid, outcome });
                 return;
             }
@@ -224,7 +311,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
             if (message.type === 'link-proof' && peer !== undefined) {
                 if (!checkProof(nonce, message.proof, peer.publicKey)) return refuse('the node did not prove it holds its key');
                 clearTimeout(timeout);
-                link = { socket, peer, served: new Map(), credit: 0, outbox: [], scheduled: false };
+                link = { socket, peer, served: new Map(), tunnels: new Map(), opening: new Map(), handed: new Map(), credit: 0, outbox: [], scheduled: false };
                 links.add(link);
                 return;
             }
@@ -236,6 +323,10 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
             links.delete(link);
             for (const served of link.served.values()) served.subscription.close();
             link.served.clear();
+            for (const session of link.tunnels.values()) session.close();
+            link.tunnels.clear();
+            for (const done of link.handed.values()) done({ result: 'rejected', reason: 'the link to the new owner closed' });
+            link.handed.clear();
         });
         socket.on('error', () => undefined);
     });

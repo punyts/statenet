@@ -1,5 +1,5 @@
 import type { Change } from '@punyts/state-sync';
-import type { Access, RelayListener, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
+import type { Access, AuthorityConnection, AuthoritySession, Handoff, RelayListener, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import WebSocket from 'ws';
 import { checkProof, newNonce, proveNode, verifyNodeCertificate } from './certificates.js';
 import type { KeyPair, NodeRole } from './certificates.js';
@@ -15,6 +15,8 @@ export interface MeshUpstreamOptions {
     readonly authorityPublicKey: string;
     /** The parents to link to, in order of preference; more are learned from the directory */
     readonly parents: readonly string[];
+    /** Whether to try the nodes the directory names when the parents do not answer; true by default (a peer link to one node: false) */
+    readonly followDirectory?: boolean;
     /** Credits granted at a time: how many subscription messages may be in flight; 256 by default */
     readonly window?: number;
     /** Grants no credit by itself (tests of a slow node): call `grant` */
@@ -48,6 +50,15 @@ export interface MeshUpstream extends Upstream {
     parent(): string | undefined;
     /** Grants credits by hand (with `manualCredit`) */
     grant(amount: number): void;
+    /**
+     * A session of a namespace the parent owns, tunnelled over the link for a view this node serves: what the session
+     * is given goes to the parent's authority, what the authority sends comes to `connection`. A dropped link closes it
+     */
+    open(address: string, connection: AuthorityConnection, access?: Access): AuthoritySession;
+    /** Claims a namespace the parent owns: its handoff, or undefined when it has none to give or the link dropped */
+    handoff(address: string): Promise<Handoff | undefined>;
+    /** Asks the parent to claim a namespace; whether it did */
+    take(address: string): Promise<boolean>;
     close(): void;
 }
 
@@ -80,6 +91,31 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     let ping: ReturnType<typeof setInterval> | undefined;
     const outbox: MeshMessage[] = [];
     let scheduled = false;
+    /** Tunnelled sessions by id; `sent` once the parent was told to open it, `buffer` what waits until then */
+    const tunnels = new Map<number, { address: string; access?: Access; connection: AuthorityConnection; sent: boolean; buffer: string[] }>();
+    /** Claims and takes by id, each sent once the link is open; a dropped link answers those it sent with nothing */
+    const claims = new Map<number, { address: string; sent: boolean; done: (handoff: Handoff | undefined) => void }>();
+    const takes = new Map<number, { address: string; sent: boolean; done: (ok: boolean) => void }>();
+    const sendAsks = (): void => {
+        if (!ready) return;
+        for (const [cid, claim] of claims) if (!claim.sent) {
+            claim.sent = true;
+            queue({ type: 'claim', cid, address: claim.address });
+        }
+        for (const [cid, take] of takes) if (!take.sent) {
+            take.sent = true;
+            queue({ type: 'take', cid, address: take.address });
+        }
+    };
+    let nextTid = 1;
+    let nextCid = 1;
+    const openTunnel = (tid: number): void => {
+        const tunnel = tunnels.get(tid);
+        if (tunnel === undefined || tunnel.sent || !ready) return;
+        tunnel.sent = true;
+        queue({ type: 'open', tid, address: tunnel.address, ...(tunnel.access === undefined ? {} : { access: tunnel.access }) });
+        for (const text of tunnel.buffer.splice(0)) queue({ type: 'say', tid, text });
+    };
 
     const send = (message: LinkMessage): void => {
         if (socket !== undefined && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
@@ -97,7 +133,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     };
 
     /** The parents to try, in order: the configured ones, then any other node the directory names */
-    const candidates = (): string[] => [...new Set([...options.parents, ...(directory?.nodes ?? []).filter((node) => node.endpoint !== '' && node.id !== options.nodeId).map((node) => node.endpoint)])];
+    const candidates = (): string[] => [...new Set([...options.parents, ...(options.followDirectory === false ? [] : directory?.nodes ?? []).filter((node) => node.endpoint !== '' && node.id !== options.nodeId).map((node) => node.endpoint)])];
 
     const subscribeMessage = (sid: number, want: Wanted): MeshMessage => ({ type: 'subscribe', sid, address: want.address, prefix: want.prefix, ...(want.revision === undefined ? {} : { revision: want.revision }), ...(want.access === undefined ? {} : { access: want.access }) });
 
@@ -107,6 +143,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         if (options.manualCredit !== true) queue({ type: 'credit', amount: window });
         for (const [sid, want] of wanted) queue(subscribeMessage(sid, want));
         for (const [wid, write] of writes) queue({ type: 'write', wid, address: write.address, change: write.change, ...(write.access === undefined ? {} : { access: write.access }) });
+        for (const tid of tunnels.keys()) openTunnel(tid);
+        sendAsks();
     };
 
     /** Takes one subscription message off the link, and grants credit back in steps */
@@ -164,6 +202,36 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 directory = message.directory;
                 options.onDirectory?.(message.directory);
                 return;
+            case 'say':
+                tunnels.get(message.tid)?.connection.send(message.text);
+                return;
+            case 'shut': {
+                const tunnel = tunnels.get(message.tid);
+                tunnels.delete(message.tid);
+                tunnel?.connection.close();
+                return;
+            }
+            case 'handoff': {
+                const done = claims.get(message.cid)?.done;
+                claims.delete(message.cid);
+                const cid = message.cid;
+                done?.(
+                    message.handoff === undefined
+                        ? undefined
+                        : {
+                              revision: message.handoff.revision,
+                              epoch: message.handoff.epoch,
+                              queued: message.handoff.queued.map(({ qid, change }) => ({ change, done: (outcome: WriteOutcome) => queue({ type: 'handed', cid, qid, outcome }) }))
+                          }
+                );
+                return;
+            }
+            case 'taken': {
+                const done = takes.get(message.cid)?.done;
+                takes.delete(message.cid);
+                done?.(message.ok);
+                return;
+            }
             default:
                 return;
         }
@@ -175,6 +243,20 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         current = undefined;
         if (ping !== undefined) clearInterval(ping);
         ping = undefined;
+        // what was open over the link ends with it: the views reconnect, and the claims are answered with nothing
+        for (const [tid, tunnel] of [...tunnels]) {
+            if (!tunnel.sent) continue;
+            tunnels.delete(tid);
+            tunnel.connection.close();
+        }
+        for (const [cid, claim] of [...claims]) if (claim.sent) {
+            claims.delete(cid);
+            claim.done(undefined);
+        }
+        for (const [cid, take] of [...takes]) if (take.sent) {
+            takes.delete(cid);
+            take.done(false);
+        }
         if (closed) return;
         timer = setTimeout(connect, backoff(attempt++));
         (timer as { unref?: () => void }).unref?.();
@@ -253,8 +335,44 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         linked: () => ready,
         parent: () => current,
         grant: (amount) => queue({ type: 'credit', amount }),
+        open: (address, connection, access) => {
+            const tid = nextTid++;
+            tunnels.set(tid, { address, connection, sent: false, buffer: [], ...(access === undefined ? {} : { access }) });
+            openTunnel(tid);
+            return {
+                receive: (text) => {
+                    const tunnel = tunnels.get(tid);
+                    if (tunnel === undefined) return;
+                    if (tunnel.sent) queue({ type: 'say', tid, text });
+                    else tunnel.buffer.push(text);
+                },
+                close: () => {
+                    const tunnel = tunnels.get(tid);
+                    tunnels.delete(tid);
+                    if (tunnel?.sent === true) queue({ type: 'shut', tid, reason: 'closed' });
+                }
+            };
+        },
+        handoff: (address) =>
+            new Promise((done) => {
+                if (closed) return done(undefined);
+                claims.set(nextCid++, { address, sent: false, done });
+                sendAsks();
+            }),
+        take: (address) =>
+            new Promise((done) => {
+                if (closed) return done(false);
+                takes.set(nextCid++, { address, sent: false, done });
+                sendAsks();
+            }),
         close: () => {
             closed = true;
+            for (const tunnel of tunnels.values()) tunnel.connection.close();
+            tunnels.clear();
+            for (const claim of claims.values()) claim.done(undefined);
+            claims.clear();
+            for (const take of takes.values()) take.done(false);
+            takes.clear();
             if (timer !== undefined) clearTimeout(timer);
             if (ping !== undefined) clearInterval(ping);
             socket?.terminate();

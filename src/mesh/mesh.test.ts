@@ -139,7 +139,7 @@ describe('the mesh', () => {
         const fromEdge = atServer.ids.find((id) => !id.startsWith('m')) as string;
         const tail = (ids: string[]) => ids.filter((id) => id !== fromEdge);
         expect(tail(atEdge.ids)).toEqual(tail(atServer.ids));
-        expect(owner.authorityOf(ADDRESS)?.get('$.data.fromEdge')).toBe(true);
+        expect((await owner.authorityOf(ADDRESS))?.get('$.data.fromEdge')).toBe(true);
     });
 
     it('should refuse a link from a node without a certificate from the authority', async () => {
@@ -184,7 +184,7 @@ describe('the mesh', () => {
 
         // Assert
         expect(mostHeld).toBeLessThanOrEqual(51);
-        await vi.waitFor(() => expect(one.state.value).toEqual(owner.authorityOf(ADDRESS)?.get('$.data')));
+        await vi.waitFor(async () => expect(one.state.value).toEqual((await owner.authorityOf(ADDRESS))?.get('$.data')));
         expect(one.state.repeats).toBe(0);
     });
 

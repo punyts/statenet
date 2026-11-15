@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Owner nodes over the mesh.** `startOwnerMesh` runs an owner node of an app server with its links: `createPeerLinks` links to the other owner nodes the directory names (forwarded writes, claims and handoffs, and a peer asked to claim, as `claim`, `handoff`, `handed`, `take` and `taken` messages), `connect` serves a client session with the authority here or tunnels it to the owner (`open`, `say`, `shut`), so a view keeps its writes and emits both ways, and `createPlacedUpstream` keeps a relay subscription following a namespace as it moves. A mesh server takes `sessions`, `handoff` and `take`, and passes the node a write came from to `write`; a mesh upstream with `followDirectory: false` stays on its parents. Tests: `ownerMesh.test.ts`.
+
 - **The mesh: links between nodes, and relay processes.** `startMeshServer` is a node's side of the links below it: one
   WebSocket per node, opened with a certificate Magnetic's authority signed (`issueNodeCertificate`) and a proof of the
   node's key each way, then frames of `subscribe`, `renew`, `changes`, `durable`, `write`, `revoked`, `credit` and

@@ -37,7 +37,22 @@ export type MeshMessage =
     | { type: 'write'; wid: number; address: string; change: Change; access?: Access }
     | { type: 'written'; wid: number; outcome: WriteOutcome }
     | { type: 'credit'; amount: number }
-    | { type: 'directory'; directory: DirectoryView };
+    | { type: 'directory'; directory: DirectoryView }
+    /**
+     * A session of a namespace the node at the other end owns, tunnelled for a view this node serves: `open` starts it,
+     * `say` carries each sync message either way as its text, `shut` ends it from either end
+     */
+    | { type: 'open'; tid: number; address: string; access?: Access }
+    | { type: 'say'; tid: number; text: string }
+    | { type: 'shut'; tid: number; reason: string }
+    /** A claim (docs/design/statenet-relays.md, "Ownership moves by a claim"): the owner answers with its handoff, or none */
+    | { type: 'claim'; cid: number; address: string }
+    | { type: 'handoff'; cid: number; handoff?: { revision: number; epoch: number; queued: Array<{ qid: number; change: Change }> } }
+    /** The claimant's outcome of a write that was queued in the handoff, for the node that is waiting on it */
+    | { type: 'handed'; cid: number; qid: number; outcome: WriteOutcome }
+    /** The owner asks the node at the other end to claim a namespace (it sends most of the writes), and hears whether it did */
+    | { type: 'take'; cid: number; address: string }
+    | { type: 'taken'; cid: number; ok: boolean };
 
 /** Many messages from one moment, of many namespaces, in one WebSocket message */
 export type MeshFrame = { type: 'frame'; messages: MeshMessage[] };
