@@ -14,6 +14,7 @@ Usage: statenet-relay [options]
   --node-key <file>       Its key pair, JSON { privateKey, publicKey }       STATENET_NODE_KEY_FILE
   --certificate <file>    Its certificate from Magnetic's authority          STATENET_NODE_CERTIFICATE_FILE
   --authority-key <key>   The authority's public key (base64url)             STATENET_AUTHORITY_PUBLIC_KEY
+  --authority-key-file    A file holding it (magnetic relay-certificate)     STATENET_AUTHORITY_PUBLIC_KEY_FILE
   --host <host>           The address it listens on (127.0.0.1)              STATENET_HOST
   --mesh-port <port>      The port relays below link to (4310)               STATENET_MESH_PORT
   --client-port <port>    The port browsers connect to (4311)                STATENET_CLIENT_PORT
@@ -39,6 +40,8 @@ const main = async (): Promise<void> => {
     };
     const keys = JSON.parse(await readFile(value('node-key', 'STATENET_NODE_KEY_FILE'), 'utf8')) as KeyPair;
     const certificate = (await readFile(value('certificate', 'STATENET_NODE_CERTIFICATE_FILE'), 'utf8')).trim();
+    const authorityFile = read(argv, process.env, 'authority-key-file', 'STATENET_AUTHORITY_PUBLIC_KEY_FILE');
+    const authorityPublicKey = authorityFile !== undefined && authorityFile !== '' ? (await readFile(authorityFile, 'utf8')).trim() : value('authority-key', 'STATENET_AUTHORITY_PUBLIC_KEY');
     setCategories(['statenet', 'state-sync', 'warning', 'error']);
     addListener((_timestamp, category, message) => process.stderr.write(`[${category}] ${message}\n`));
     const region = read(argv, process.env, 'region', 'STATENET_REGION');
@@ -47,7 +50,7 @@ const main = async (): Promise<void> => {
         ...(region === undefined ? {} : { region }),
         keys,
         certificate,
-        authorityPublicKey: value('authority-key', 'STATENET_AUTHORITY_PUBLIC_KEY'),
+        authorityPublicKey,
         parents: value('parents', 'STATENET_PARENTS').split(',').map((url) => url.trim()).filter((url) => url !== ''),
         host: read(argv, process.env, 'host', 'STATENET_HOST') ?? '127.0.0.1',
         meshPort: Number(read(argv, process.env, 'mesh-port', 'STATENET_MESH_PORT') ?? 4310),

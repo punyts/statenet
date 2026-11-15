@@ -290,6 +290,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 options.onDirectory?.(message.directory);
                 send({ type: 'link-proof', proof: proveNode(message.nonce, options.keys.privateKey) });
                 current = url;
+                options.report?.(`Linked to the parent at ${url}`);
                 opened();
                 ping = setInterval(() => {
                     if (now() - lastHeard > silenceMs) link.terminate();
