@@ -65,6 +65,22 @@ the changes its authority makes (logic, tools) are written here, and a page's ch
 goes to its authority, which may put the value back. The document, commands, reports and files go over the emit relay.
 It keeps a directory of the apps in the namespace `stateui.apps`. `$.server` never leaves the app server.
 
+## The mesh
+
+Nodes of a larger statenet link to each other (`docs/design/statenet-relays.md`, "The mesh protocol"): an owner node
+serves its namespaces down, and relays cache what is subscribed through them and serve browsers at the edge.
+
+- Every node has its own Ed25519 key and a certificate from Magnetic's authority (`issueNodeCertificate`); a link opens
+  only between nodes that show one and prove they hold their key.
+- `startMeshServer` serves the links below a node; `createMeshUpstream` is a node's link up, which reconnects to another
+  parent and catches up from where it was. Credits per link keep a slow node from growing its parent's memory.
+- `statenet-relay` runs a relay process: it reaches no database and learns the owners, the nodes and the keys that sign
+  grants from its parent.
+
+```bash
+statenet-relay --node-id relay-eu --parents wss://core.example/mesh --node-key key.json --certificate relay-eu.cert --authority-key <base64url>
+```
+
 ## Security
 
 - **Loopback only.** The statenet has no authentication, so it refuses to start on an address that is not loopback

@@ -5,11 +5,12 @@
         "access": "public"
     },
     "type": "module",
-    "description": "A Node service that persists @punyts/state-sync namespaces and speaks the sync protocol over a WebSocket",
+    "description": "A Node service that persists @punyts/state-sync namespaces, speaks the sync protocol over a WebSocket, and runs the mesh of owner nodes and relays",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "bin": {
-        "statenet": "dist/cli.js"
+        "statenet": "dist/cli.js",
+        "statenet-relay": "dist/relayCli.js"
     },
     "files": [
         "dist",
@@ -40,6 +41,7 @@
         "ws": "^8.21.1"
     },
     "devDependencies": {
+        "@punyts/state": "^1.2.0",
         "@types/node": "^26.1.1",
         "@types/ws": "^8.18.1",
         "typescript": "^5.9.3",
