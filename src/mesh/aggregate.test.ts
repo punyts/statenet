@@ -1,0 +1,315 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Change } from '@punyts/state-sync';
+import { createMemoryEpochStorage, createMemoryOwnershipStore, FencedError, OwnerNode } from '@punyts/state-sync/authority';
+import type { EpochStorage, StoredNamespace } from '@punyts/state-sync/authority';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createFileEpochStorage } from '../FileEpochStorage.js';
+import { createAggregate, createAggregateStorage, startAggregateNode } from './Aggregate.js';
+import { generateKeyPair, issueNodeCertificate } from './certificates.js';
+import type { KeyPair, NodeRole } from './certificates.js';
+import { createMeshUpstream } from './MeshUpstream.js';
+import { startRelayNode } from './RelayNode.js';
+
+const HOUR = 3_600_000;
+const ADDRESS = 'alice/notes/user';
+const authority = generateKeyPair();
+const closers: Array<() => Promise<void> | void> = [];
+
+afterEach(async () => {
+    for (const close of closers.splice(0).reverse()) await close();
+});
+
+const certificateFor = (nodeId: string, role: NodeRole, keys: KeyPair): string => issueNodeCertificate({ nodeId, role, region: '', publicKey: keys.publicKey, expires: Date.now() + HOUR }, authority.privateKey);
+
+const stored = (revision: number, state: StoredNamespace['state'] = { n: revision }): StoredNamespace => ({ state, revision, log: [], applied: [] });
+
+let counter = 0;
+const change = (path: string, value: unknown): Change => ({ id: `a${++counter}`, path, op: 'set', value: value as never, base: 0 });
+
+/** Memory storage that counts its saves and can hold them back until `release` */
+function gatedStorage() {
+    const memory = createMemoryEpochStorage();
+    const saved: number[] = [];
+    let gate: Promise<void> | undefined;
+    let open: (() => void) | undefined;
+    const storage: EpochStorage = {
+        load: (address) => memory.load(address),
+        save: async (address, value, epoch) => {
+            await gate;
+            await memory.save(address, value, epoch);
+            saved.push(value.revision);
+        }
+    };
+    return {
+        storage,
+        memory,
+        saved,
+        hold: () => {
+            gate = new Promise((resolve) => (open = resolve));
+        },
+        release: () => {
+            gate = undefined;
+            open?.();
+        }
+    };
+}
+
+/** An aggregate, a relay linked to it, and a node's link to the relay: the path of a save over real sockets */
+async function chain(storage: EpochStorage, mayPersist?: (address: string, node: string | undefined) => boolean) {
+    const aggregateKeys = generateKeyPair();
+    const aggregate = await startAggregateNode({ nodeId: 'aggregate-1', keys: aggregateKeys, certificate: certificateFor('aggregate-1', 'aggregate', aggregateKeys), authorityPublicKey: authority.publicKey, storage, ...(mayPersist === undefined ? {} : { mayPersist }) });
+    const relayKeys = generateKeyPair();
+    const relay = await startRelayNode({ nodeId: 'relay-1', keys: relayKeys, certificate: certificateFor('relay-1', 'relay', relayKeys), authorityPublicKey: authority.publicKey, parents: [aggregate.url], checkGrants: false, upstream: { renewWithinMs: 0, followDirectory: false } });
+    const nodeKeys = generateKeyPair();
+    const link = createMeshUpstream({ nodeId: 'node-1', role: 'owner', keys: nodeKeys, certificate: certificateFor('node-1', 'owner', nodeKeys), authorityPublicKey: authority.publicKey, parents: [relay.meshUrl], followDirectory: false, renewWithinMs: 0 });
+    closers.push(() => link.close(), () => relay.close(), () => aggregate.close());
+    await vi.waitFor(() => expect(link.linked() && relay.upstream.linked()).toBe(true));
+    return { aggregate, relay, link };
+}
+
+describe('the aggregate', () => {
+    it('should save a namespace and answer with the revision that landed', async () => {
+        // Arrange
+        const { storage, memory, saved } = gatedStorage();
+        const aggregate = createAggregate(storage);
+
+        // Act
+        const outcome = await aggregate.persist(ADDRESS, stored(3), 1);
+
+        // Assert
+        expect(outcome).toEqual({ result: 'saved', revision: 3 });
+        expect(saved).toEqual([3]);
+        expect((await memory.load(ADDRESS))?.state).toEqual({ n: 3 });
+    });
+
+    it('should write nothing for a save sent again, or one below what already landed', async () => {
+        // Arrange
+        const { storage, saved } = gatedStorage();
+        const aggregate = createAggregate(storage);
+        await aggregate.persist(ADDRESS, stored(5), 1);
+
+        // Act
+        const again = await aggregate.persist(ADDRESS, stored(5), 1);
+        const older = await aggregate.persist(ADDRESS, stored(4), 1);
+
+        // Assert
+        expect(again).toEqual({ result: 'saved', revision: 5 });
+        expect(older).toEqual({ result: 'saved', revision: 5 });
+        expect(saved).toEqual([5]);
+        expect(aggregate.stats()).toMatchObject({ saves: 1, folded: 2 });
+    });
+
+    it('should fold the saves that arrive while one runs into one batch, and answer each when it lands', async () => {
+        // Arrange
+        const { storage, saved, hold, release } = gatedStorage();
+        const aggregate = createAggregate(storage);
+        hold();
+
+        // Act
+        const first = aggregate.persist(ADDRESS, stored(1), 1);
+        const second = aggregate.persist(ADDRESS, stored(2), 1);
+        const third = aggregate.persist(ADDRESS, stored(3), 1);
+        let answered = false;
+        void third.then(() => (answered = true));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const before = answered;
+        release();
+
+        // Assert
+        expect(before).toBe(false);
+        expect(await Promise.all([first, second, third])).toEqual([
+            { result: 'saved', revision: 1 },
+            { result: 'saved', revision: 3 },
+            { result: 'saved', revision: 3 }
+        ]);
+        expect(saved).toEqual([1, 3]);
+    });
+
+    it('should fence a save under an older epoch and write nothing, by its own count and by the storage\'s', async () => {
+        // Arrange: the storage already holds epoch 4, which a new aggregate has not seen
+        const { storage, memory, saved } = gatedStorage();
+        await memory.save(ADDRESS, stored(9), 4);
+        const aggregate = createAggregate(storage);
+
+        // Act
+        const byStorage = await aggregate.persist(ADDRESS, stored(10), 3);
+        const byCount = await aggregate.persist(ADDRESS, stored(11), 3);
+        const newer = await aggregate.persist(ADDRESS, stored(12), 5);
+
+        // Assert
+        expect(byStorage).toEqual({ result: 'fenced', epoch: 3, current: 4 });
+        expect(byCount).toEqual({ result: 'fenced', epoch: 3, current: 4 });
+        expect(newer).toEqual({ result: 'saved', revision: 12 });
+        expect(saved).toEqual([12]);
+        expect(aggregate.stats().fenced).toBe(2);
+    });
+
+    it('should answer a waiting save of the old owner as fenced when the new owner\'s save takes its place', async () => {
+        // Arrange
+        const { storage, saved, hold, release } = gatedStorage();
+        const aggregate = createAggregate(storage);
+        hold();
+        const running = aggregate.persist(ADDRESS, stored(1), 1);
+
+        // Act
+        const old = aggregate.persist(ADDRESS, stored(2), 1);
+        const taken = aggregate.persist(ADDRESS, stored(2, { by: 'new' }), 2);
+        release();
+
+        // Assert
+        expect(await old).toEqual({ result: 'fenced', epoch: 1, current: 2 });
+        expect(await running).toEqual({ result: 'saved', revision: 1 });
+        expect(await taken).toEqual({ result: 'saved', revision: 2 });
+        expect(saved).toEqual([1, 2]);
+    });
+
+    it('should refuse a save from a node that does not order the namespace, and say a failed save failed', async () => {
+        // Arrange
+        const broken: EpochStorage = { load: async () => undefined, save: async () => Promise.reject(new Error('the disk is full')) };
+        const guarded = createAggregate(createMemoryEpochStorage(), { mayPersist: (_address, node) => node === 'node-1' });
+        const failing = createAggregate(broken);
+
+        // Act
+        const outcomes = [await guarded.persist(ADDRESS, stored(1), 1, 'node-2'), await guarded.persist(ADDRESS, stored(1), 1, 'node-1'), await failing.persist(ADDRESS, stored(1), 1)];
+
+        // Assert
+        expect(outcomes).toEqual([{ result: 'failed', reason: `node-2 does not order ${ADDRESS}` }, { result: 'saved', revision: 1 }, { result: 'failed', reason: 'the disk is full' }]);
+    });
+});
+
+describe('a node that saves through an aggregate', () => {
+    it('should call a change durable only once the aggregate saved it', async () => {
+        // Arrange: a node in the same process as its aggregate
+        const { storage, memory, hold, release } = gatedStorage();
+        const aggregate = createAggregate(storage);
+        const node = new OwnerNode({ id: 'node-1', ownership: createMemoryOwnershipStore(), storage: createAggregateStorage(aggregate, 'node-1'), link: () => undefined, initial: () => ({ data: {} }) });
+        closers.push(() => node.stop());
+        hold();
+
+        // Act
+        const written = await node.write(ADDRESS, change('$.data.n', 1));
+        const authorityOf = await node.authorityOf(ADDRESS);
+        let durable = false;
+        void authorityOf?.whenDurable().then(() => (durable = true));
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        const before = durable;
+        release();
+
+        // Assert
+        expect(written).toMatchObject({ result: 'applied' });
+        expect(before).toBe(false);
+        await vi.waitFor(() => expect(durable).toBe(true));
+        expect((await memory.load(ADDRESS))?.state).toEqual({ data: { n: 1 } });
+    });
+
+    it('should throw FencedError from a save the aggregate fenced, and the reason of one that failed', async () => {
+        // Arrange
+        const memory = createMemoryEpochStorage();
+        await memory.save(ADDRESS, stored(1), 2);
+        const storage = createAggregateStorage(createAggregate(memory, { mayPersist: (_address, _node, epoch) => epoch !== 7 }), 'node-1');
+
+        // Act
+        const fenced = await storage.save(ADDRESS, stored(2), 1).catch((error: unknown) => error);
+        const failed = await storage.save(ADDRESS, stored(2), 7).catch((error: unknown) => error);
+
+        // Assert
+        expect(fenced).toBeInstanceOf(FencedError);
+        expect(fenced).toMatchObject({ epoch: 1, current: 2 });
+        expect((failed as Error).message).toContain('does not order');
+    });
+
+    it('should save and load over its link to a relay and the relay\'s to an aggregate, the aggregate hearing which node it is', async () => {
+        // Arrange
+        const memory = createMemoryEpochStorage();
+        const heard: Array<string | undefined> = [];
+        const { link, aggregate } = await chain(memory, (_address, node) => {
+            heard.push(node);
+            return true;
+        });
+        const node = new OwnerNode({ id: 'node-1', ownership: createMemoryOwnershipStore(), storage: createAggregateStorage(link), link: () => undefined, initial: () => ({ data: {} }) });
+        closers.push(() => node.stop());
+
+        // Act
+        await node.write(ADDRESS, change('$.data.n', 1));
+        await node.write(ADDRESS, change('$.data.m', 2));
+        await (await node.authorityOf(ADDRESS))?.whenDurable();
+        const loaded = await createAggregateStorage(link).load(ADDRESS);
+        const nothing = await createAggregateStorage(link).load('alice/other/user');
+
+        // Assert
+        expect((await memory.load(ADDRESS))?.state).toEqual({ data: { n: 1, m: 2 } });
+        expect(loaded?.state).toEqual({ data: { n: 1, m: 2 } });
+        expect(nothing).toBeUndefined();
+        expect(new Set(heard)).toEqual(new Set(['node-1']));
+        expect(aggregate.aggregate.stats().saves).toBeGreaterThan(0);
+    });
+
+    it('should send a save again over another relay when its link drops, the aggregate writing it once', async () => {
+        // Arrange: two relays under one aggregate, the node linked to the first, and a save held at the storage
+        const { storage, saved, hold, release } = gatedStorage();
+        const { aggregate, relay, link } = await chain(storage);
+        const otherKeys = generateKeyPair();
+        const other = await startRelayNode({ nodeId: 'relay-2', keys: otherKeys, certificate: certificateFor('relay-2', 'relay', otherKeys), authorityPublicKey: authority.publicKey, parents: [aggregate.url], checkGrants: false, upstream: { renewWithinMs: 0, followDirectory: false } });
+        const nodeKeys = generateKeyPair();
+        const node = createMeshUpstream({ nodeId: 'node-2', role: 'owner', keys: nodeKeys, certificate: certificateFor('node-2', 'owner', nodeKeys), authorityPublicKey: authority.publicKey, parents: [relay.meshUrl, other.meshUrl], followDirectory: false, renewWithinMs: 0, backoff: () => 20 });
+        closers.push(() => node.close(), () => other.close());
+        await vi.waitFor(() => expect(node.linked() && other.upstream.linked()).toBe(true));
+        link.close();
+        hold();
+        const pending = node.persist(ADDRESS, stored(1), 1);
+        await vi.waitFor(() => expect(aggregate.mesh.stats().links).toHaveLength(2));
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        // Act: the first relay goes away with the save unanswered
+        await relay.close();
+        await vi.waitFor(() => expect(node.parent()).toBe(other.meshUrl));
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        release();
+
+        // Assert
+        expect(await pending).toEqual({ result: 'saved', revision: 1 });
+        expect(saved).toEqual([1]);
+        expect(aggregate.aggregate.stats().folded).toBe(1);
+    });
+
+    it('should answer a save still waiting when its link is closed', async () => {
+        // Arrange: a relay with nothing above it, so what it passes up is never answered
+        const topKeys = generateKeyPair();
+        const top = await startRelayNode({ nodeId: 'relay-top', keys: topKeys, certificate: certificateFor('relay-top', 'relay', topKeys), authorityPublicKey: authority.publicKey, parents: [], checkGrants: false });
+        const nodeKeys = generateKeyPair();
+        const link = createMeshUpstream({ nodeId: 'node-1', role: 'owner', keys: nodeKeys, certificate: certificateFor('node-1', 'owner', nodeKeys), authorityPublicKey: authority.publicKey, parents: [top.meshUrl], followDirectory: false, renewWithinMs: 0 });
+        closers.push(() => link.close(), () => top.close());
+        await vi.waitFor(() => expect(link.linked()).toBe(true));
+
+        // Act
+        const pending = link.persist(ADDRESS, stored(1), 1);
+        link.close();
+
+        // Assert
+        expect(await pending).toEqual({ result: 'failed', reason: 'the link is closed' });
+    });
+});
+
+describe('epoch storage in files', () => {
+    it('should keep a namespace and its epoch across starts, and refuse a save under an older epoch', async () => {
+        // Arrange
+        const dataDir = await mkdtemp(join(tmpdir(), 'statenet-aggregate-'));
+        closers.push(() => rm(dataDir, { recursive: true, force: true }));
+        const first = createFileEpochStorage({ dataDir });
+        await first.save(ADDRESS, stored(1), 1);
+        await first.save(ADDRESS, stored(2), 3);
+
+        // Act
+        const second = createFileEpochStorage({ dataDir });
+        const refused = await second.save(ADDRESS, stored(3), 2).catch((error: unknown) => error);
+        await second.save(ADDRESS, stored(4), 3);
+
+        // Assert
+        expect(refused).toBeInstanceOf(FencedError);
+        expect(refused).toMatchObject({ epoch: 2, current: 3 });
+        expect((await second.load(ADDRESS))?.revision).toBe(4);
+        expect(await second.load('alice/other/user')).toBeUndefined();
+    });
+});

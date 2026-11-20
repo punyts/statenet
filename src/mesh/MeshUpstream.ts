@@ -1,12 +1,12 @@
 import type { Change } from '@punyts/state-sync';
-import type { Access, AuthorityConnection, AuthoritySession, Handoff, RelayListener, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
+import type { Access, AuthorityConnection, AuthoritySession, Handoff, RelayListener, RelaySubscription, StoredNamespace, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import WebSocket from 'ws';
 import { checkProof, mayLink, newNonce, proveNode, verifyNodeCertificate } from './certificates.js';
 import { newShare, sealOf, transcript } from './sealing.js';
 import type { LinkSeal } from './sealing.js';
 import type { KeyPair, NodeRole } from './certificates.js';
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
-import type { DirectoryView, LinkMessage, MeshMessage } from './protocol.js';
+import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome } from './protocol.js';
 
 export interface MeshUpstreamOptions {
     readonly nodeId: string;
@@ -71,6 +71,13 @@ export interface MeshUpstream extends Upstream {
     take(address: string): Promise<boolean>;
     /** The certificate this node shows now */
     certificate(): string;
+    /**
+     * Sends a namespace up to be saved, and answers when the aggregate did (docs/design/statenet-network.md). A save
+     * not yet answered when the link drops is sent again on the next one; the aggregate writes nothing twice
+     */
+    persist(address: string, stored: StoredNamespace, epoch: number, node?: string): Promise<PersistOutcome>;
+    /** Loads a namespace from the aggregate; asked again on the next link when this one drops */
+    load(address: string, node?: string): Promise<LoadOutcome>;
     /** Asks the parent for a certificate's next one (this node's, or one a node below asked for); undefined when it gives none */
     certify(certificate: string): Promise<string | undefined>;
     close(): void;
@@ -112,6 +119,11 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     const claims = new Map<number, { address: string; sent: boolean; done: (handoff: Handoff | undefined) => void }>();
     const takes = new Map<number, { address: string; sent: boolean; done: (ok: boolean) => void }>();
     const certifies = new Map<number, { certificate: string; sent: boolean; done: (certificate: string | undefined) => void }>();
+    /** Saves and loads not yet answered: kept across links, like writes */
+    const persists = new Map<number, { address: string; stored: StoredNamespace; epoch: number; node?: string; done: (outcome: PersistOutcome) => void }>();
+    const loads = new Map<number, { address: string; node?: string; done: (outcome: LoadOutcome) => void }>();
+    const persistMessage = (pid: number, save: { address: string; stored: StoredNamespace; epoch: number; node?: string }): MeshMessage => ({ type: 'persist', pid, address: save.address, epoch: save.epoch, stored: save.stored, ...(save.node === undefined ? {} : { node: save.node }) });
+    const loadMessage = (lid: number, load: { address: string; node?: string }): MeshMessage => ({ type: 'load', lid, address: load.address, ...(load.node === undefined ? {} : { node: load.node }) });
     /** What seals the open link's messages; undefined until its handshake is through */
     let seal: LinkSeal | undefined;
     /** The certificate as text, when this node renews it over its link */
@@ -198,6 +210,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         for (const [sid, want] of wanted) queue(subscribeMessage(sid, want));
         for (const [wid, write] of writes) queue({ type: 'write', wid, address: write.address, change: write.change, ...(write.access === undefined ? {} : { access: write.access }) });
         for (const tid of tunnels.keys()) openTunnel(tid);
+        for (const [pid, save] of persists) queue(persistMessage(pid, save));
+        for (const [lid, load] of loads) queue(loadMessage(lid, load));
         sendAsks();
     };
 
@@ -250,6 +264,18 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 const write = writes.get(message.wid);
                 writes.delete(message.wid);
                 write?.done(message.outcome);
+                return;
+            }
+            case 'persisted': {
+                const done = persists.get(message.pid)?.done;
+                persists.delete(message.pid);
+                done?.(message.outcome);
+                return;
+            }
+            case 'loaded': {
+                const done = loads.get(message.lid)?.done;
+                loads.delete(message.lid);
+                done?.(message.outcome);
                 return;
             }
             case 'certified': {
@@ -465,6 +491,22 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             }),
         certificate: certificateNow,
         certify,
+        persist: (address, stored, epoch, node) =>
+            new Promise((done) => {
+                if (closed) return done({ result: 'failed', reason: 'the link is closed' });
+                const pid = nextCid++;
+                const save = { address, stored, epoch, ...(node === undefined ? {} : { node }), done };
+                persists.set(pid, save);
+                queue(persistMessage(pid, save));
+            }),
+        load: (address, node) =>
+            new Promise((done) => {
+                if (closed) return done({ ok: false, reason: 'the link is closed' });
+                const lid = nextCid++;
+                const load = { address, ...(node === undefined ? {} : { node }), done };
+                loads.set(lid, load);
+                queue(loadMessage(lid, load));
+            }),
         close: () => {
             closed = true;
             for (const tunnel of tunnels.values()) tunnel.connection.close();
@@ -475,6 +517,10 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             takes.clear();
             for (const ask of certifies.values()) ask.done(undefined);
             certifies.clear();
+            for (const save of persists.values()) save.done({ result: 'failed', reason: 'the link is closed' });
+            persists.clear();
+            for (const load of loads.values()) load.done({ ok: false, reason: 'the link is closed' });
+            loads.clear();
             if (timer !== undefined) clearTimeout(timer);
             if (ping !== undefined) clearInterval(ping);
             socket?.terminate();

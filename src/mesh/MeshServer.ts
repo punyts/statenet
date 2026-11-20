@@ -3,7 +3,7 @@ import type { Server as HttpServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import type { Change, RevisedChange } from '@punyts/state-sync';
-import type { Access, Authority, AuthoritySession, Handoff, RelayBatch, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
+import type { Access, Authority, AuthoritySession, Handoff, RelayBatch, RelaySubscription, StoredNamespace, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import { checkProof, mayLink, newNonce, proveNode, verifyNodeCertificate } from './certificates.js';
@@ -11,7 +11,7 @@ import { newShare, sealOf, transcript } from './sealing.js';
 import type { LinkSeal } from './sealing.js';
 import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
-import type { DirectoryView, LinkMessage, MeshMessage } from './protocol.js';
+import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome } from './protocol.js';
 
 /** How a node takes a write from below: it orders it as the owner, or passes it up. `via` is the node it came from */
 export type MeshWriter = (address: string, change: Change, access?: Access, via?: string) => Promise<WriteOutcome>;
@@ -33,6 +33,12 @@ export interface MeshServerOptions {
      * the directory loses its link at the next `directoryChanged`. None by default
      */
     readonly requireListed?: readonly NodeRole[];
+    /**
+     * Saves a namespace a node below sent up, and loads one: an aggregate's own, or a relay's link up to one. `node`
+     * is the node that orders it. Without them this node keeps nothing for others
+     */
+    readonly persist?: (address: string, stored: StoredNamespace, epoch: number, node: string) => Promise<PersistOutcome>;
+    readonly load?: (address: string, node: string) => Promise<LoadOutcome>;
     /** Reads the directory again, for a node that says hello and is not listed: it may have registered a moment ago */
     readonly reread?: () => Promise<void>;
     /**
@@ -296,6 +302,21 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
             case 'take': {
                 const ok = (await options.take?.(message.address).catch(() => false)) ?? false;
                 queue(link, { type: 'taken', cid: message.cid, ok });
+                return;
+            }
+            case 'persist': {
+                // a relay names the node it passes the save on for; anything else speaks for itself
+                const node = link.peer.role === 'relay' && typeof message.node === 'string' ? message.node : link.peer.nodeId;
+                const failed = (reason: string): PersistOutcome => ({ result: 'failed', reason });
+                const outcome = options.persist === undefined ? failed(`${options.nodeId} keeps nothing for other nodes`) : await options.persist(message.address, message.stored, message.epoch, node).catch((error: unknown) => failed(error instanceof Error ? error.message : String(error)));
+                queue(link, { type: 'persisted', pid: message.pid, outcome });
+                return;
+            }
+            case 'load': {
+                const node = link.peer.role === 'relay' && typeof message.node === 'string' ? message.node : link.peer.nodeId;
+                const failed = (reason: string): LoadOutcome => ({ ok: false, reason });
+                const outcome = options.load === undefined ? failed(`${options.nodeId} keeps nothing for other nodes`) : await options.load(message.address, node).catch((error: unknown) => failed(error instanceof Error ? error.message : String(error)));
+                queue(link, { type: 'loaded', lid: message.lid, outcome });
                 return;
             }
             case 'certify': {

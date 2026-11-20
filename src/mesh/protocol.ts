@@ -1,5 +1,5 @@
 import type { Change } from '@punyts/state-sync';
-import type { Access, GrantKey, RelayBatch, RelayWelcome, WriteOutcome } from '@punyts/state-sync/authority';
+import type { Access, GrantKey, RelayBatch, RelayWelcome, StoredNamespace, WriteOutcome } from '@punyts/state-sync/authority';
 import type { NodeRole } from './certificates.js';
 
 /** The version of the mesh protocol, named in `link-hello` */
@@ -15,6 +15,12 @@ export interface DirectoryView {
     readonly owners: Readonly<Record<string, { readonly node: string; readonly epoch: number }>>;
     readonly keys: Readonly<Record<string, GrantKey>>;
 }
+
+/** An aggregate's answer to a save: it landed (up to `revision`), a newer epoch holds the namespace, or it failed */
+export type PersistOutcome = { result: 'saved'; revision: number } | { result: 'fenced'; epoch: number; current: number } | { result: 'failed'; reason: string };
+
+/** An aggregate's answer to a load: the stored namespace (none when nothing is stored), or why not */
+export type LoadOutcome = { ok: true; stored?: StoredNamespace } | { ok: false; reason: string };
 
 /**
  * The handshake: each end shows its certificate and its share of the link's key, and signs the other's challenge with
@@ -42,6 +48,14 @@ export type MeshMessage =
     | { type: 'written'; wid: number; outcome: WriteOutcome }
     | { type: 'credit'; amount: number }
     | { type: 'directory'; directory: DirectoryView }
+    /**
+     * A node's namespace on its way to the database (docs/design/statenet-network.md, "Aggregates write to the
+     * database"): relays pass it up to an aggregate, naming the `node` that orders it, and pass the answer back
+     */
+    | { type: 'persist'; pid: number; address: string; epoch: number; stored: StoredNamespace; node?: string }
+    | { type: 'persisted'; pid: number; outcome: PersistOutcome }
+    | { type: 'load'; lid: number; address: string; node?: string }
+    | { type: 'loaded'; lid: number; outcome: LoadOutcome }
     /** A node asks for a certificate's next one (its own, or one a node below it asked for); none when it is refused */
     | { type: 'certify'; rid: number; certificate: string }
     | { type: 'certified'; rid: number; certificate?: string }

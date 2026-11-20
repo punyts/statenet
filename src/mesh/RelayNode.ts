@@ -82,6 +82,9 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         authorityPublicKey: options.authorityPublicKey,
         // a relay signs nothing: a node below asks through it, and the answer is the authority's
         certify: (certificate) => upstream.certify(certificate),
+        // and keeps nothing: what a node below sends to be saved goes on up, toward an aggregate
+        persist: (address, stored, epoch, node) => upstream.persist(address, stored, epoch, node),
+        load: (address, node) => upstream.load(address, node),
         upstream: relay,
         write: (address, change, access) => upstream.write(address, change, access),
         directory: () => directory,
