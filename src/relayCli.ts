@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { addListener, setCategories } from '@punyts/core';
 import type { KeyPair } from './mesh/certificates.js';
 import { startRelayNode } from './mesh/RelayNode.js';
@@ -39,7 +39,8 @@ const main = async (): Promise<void> => {
         return found;
     };
     const keys = JSON.parse(await readFile(value('node-key', 'STATENET_NODE_KEY_FILE'), 'utf8')) as KeyPair;
-    const certificate = (await readFile(value('certificate', 'STATENET_NODE_CERTIFICATE_FILE'), 'utf8')).trim();
+    const certificateFile = value('certificate', 'STATENET_NODE_CERTIFICATE_FILE');
+    const certificate = (await readFile(certificateFile, 'utf8')).trim();
     const authorityFile = read(argv, process.env, 'authority-key-file', 'STATENET_AUTHORITY_PUBLIC_KEY_FILE');
     const authorityPublicKey = authorityFile !== undefined && authorityFile !== '' ? (await readFile(authorityFile, 'utf8')).trim() : value('authority-key', 'STATENET_AUTHORITY_PUBLIC_KEY');
     setCategories(['statenet', 'state-sync', 'warning', 'error']);
@@ -51,6 +52,13 @@ const main = async (): Promise<void> => {
         keys,
         certificate,
         authorityPublicKey,
+        // the next certificate replaces the file, so a restart shows the newest; a file that cannot be written is said
+        onCertificate: (next) => {
+            void writeFile(certificateFile, `${next}\n`).then(
+                () => process.stderr.write('statenet-relay: its certificate was renewed\n'),
+                (error: unknown) => process.stderr.write(`statenet-relay: its certificate was renewed, but ${certificateFile} could not be written: ${error instanceof Error ? error.message : String(error)}\n`)
+            );
+        },
         parents: value('parents', 'STATENET_PARENTS').split(',').map((url) => url.trim()).filter((url) => url !== ''),
         host: read(argv, process.env, 'host', 'STATENET_HOST') ?? '127.0.0.1',
         meshPort: Number(read(argv, process.env, 'mesh-port', 'STATENET_MESH_PORT') ?? 4310),

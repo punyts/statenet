@@ -15,6 +15,8 @@ export interface RelayNodeOptions {
     readonly keys: KeyPair;
     readonly certificate: string;
     readonly authorityPublicKey: string;
+    /** The relay's next certificate, when its parent gave one before the old one ended: keep it for the next start */
+    readonly onCertificate?: (certificate: string) => void;
     /** The nodes to link up to, in order of preference */
     readonly parents: readonly string[];
     readonly host?: string;
@@ -58,6 +60,7 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         certificate: options.certificate,
         authorityPublicKey: options.authorityPublicKey,
         parents: options.parents,
+        ...(options.onCertificate === undefined ? {} : { onCertificate: options.onCertificate }),
         ...options.upstream,
         onDirectory: (view) => {
             directory = view;
@@ -75,8 +78,10 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         nodeId: options.nodeId,
         role: 'relay',
         keys: options.keys,
-        certificate: options.certificate,
+        certificate: () => upstream.certificate(),
         authorityPublicKey: options.authorityPublicKey,
+        // a relay signs nothing: a node below asks through it, and the answer is the authority's
+        certify: (certificate) => upstream.certify(certificate),
         upstream: relay,
         write: (address, change, access) => upstream.write(address, change, access),
         directory: () => directory,

@@ -71,7 +71,12 @@ Nodes of a larger statenet link to each other (`docs/design/statenet-relays.md`,
 serves its namespaces down, and relays cache what is subscribed through them and serve browsers at the edge.
 
 - Every node has its own Ed25519 key and a certificate from Magnetic's authority (`issueNodeCertificate`); a link opens
-  only between nodes that show one and prove they hold their key.
+  only between nodes that show one and prove they hold their key, and only between roles that link (`mayLink`: a node
+  to a relay or a node beside it, a relay to an aggregate or a relay). A server can also ask that a node be in the
+  directory (`requireListed`).
+- Everything on a link after its handshake is sealed with a key the two ends agree in it, with or without TLS
+  underneath (`docs/design/statenet-network.md`).
+- A node asks its parent for its next certificate before the old one ends; `statenet-relay` writes it over its file.
 - `startMeshServer` serves the links below a node; `createMeshUpstream` is a node's link up, which reconnects to another
   parent and catches up from where it was. Credits per link keep a slow node from growing its parent's memory.
 - `statenet-relay` runs a relay process: it reaches no database and learns the owners, the nodes and the keys that sign

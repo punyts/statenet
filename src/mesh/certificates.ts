@@ -4,6 +4,14 @@ import { generateGrantKey } from '@punyts/state-sync/authority';
 /** A node's place in the statenet */
 export type NodeRole = 'owner' | 'relay' | 'aggregate';
 
+/**
+ * Whether a node of one role may open a link to a node of another (docs/design/statenet-network.md, "Roles and who
+ * links to whom"): a node (`owner`) dials a relay or a node beside it, a relay dials an aggregate or a relay nearer
+ * the core, and nothing dials out of an aggregate. A relay may still dial a node, as the relays of
+ * statenet-relays.md do, until nodes link up to relays (S9)
+ */
+export const mayLink = (dialler: NodeRole, server: NodeRole): boolean => (dialler === 'owner' ? server === 'owner' || server === 'relay' : dialler === 'relay');
+
 /** What a node certificate says: which node, in which role, with which public key, until when */
 export interface NodeCertificateClaims {
     readonly nodeId: string;
@@ -52,12 +60,24 @@ export const verifyNodeCertificate = (certificate: unknown, authorityPublicKey: 
     if (!signed) return { ok: false, reason: "not signed by Magnetic's certificate authority" };
     try {
         const claims = JSON.parse(decode(body).toString('utf8')) as NodeCertificateClaims;
-        if (typeof claims.nodeId !== 'string' || typeof claims.publicKey !== 'string' || typeof claims.expires !== 'number') return { ok: false, reason: 'not a certificate' };
+        if (typeof claims.nodeId !== 'string' || typeof claims.publicKey !== 'string' || typeof claims.expires !== 'number' || !['owner', 'relay', 'aggregate'].includes(claims.role)) return { ok: false, reason: 'not a certificate' };
         if (claims.expires <= now) return { ok: false, reason: 'the certificate expired' };
         return { ok: true, claims };
     } catch {
         return { ok: false, reason: 'not a certificate' };
     }
+};
+
+/**
+ * The same certificate with a later end (docs/design/statenet-network.md: certificates are short, and a node asks for
+ * its next one over its link): the node, role, region and key stay as the authority first signed them. Undefined when
+ * the certificate is not one the authority signed, or has ended
+ */
+export const renewNodeCertificate = (certificate: unknown, authority: KeyPair, expires: number, now: number): string | undefined => {
+    const checked = verifyNodeCertificate(certificate, authority.publicKey, now);
+    if (!checked.ok) return undefined;
+    const { nodeId, role, region, publicKey } = checked.claims;
+    return issueNodeCertificate({ nodeId, role, region, publicKey, expires }, authority.privateKey);
 };
 
 /** A fresh challenge for the other end of a link to sign */

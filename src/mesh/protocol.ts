@@ -3,7 +3,7 @@ import type { Access, GrantKey, RelayBatch, RelayWelcome, WriteOutcome } from '@
 import type { NodeRole } from './certificates.js';
 
 /** The version of the mesh protocol, named in `link-hello` */
-export const MESH_PROTOCOL = 1;
+export const MESH_PROTOCOL = 2;
 
 /**
  * What a parent tells a node below it about the statenet (docs/design/statenet-relays.md, "The directory"), so a relay
@@ -11,14 +11,18 @@ export const MESH_PROTOCOL = 1;
  * sign grants
  */
 export interface DirectoryView {
-    readonly nodes: ReadonlyArray<{ readonly id: string; readonly role: NodeRole; readonly region: string; readonly endpoint: string }>;
+    readonly nodes: ReadonlyArray<{ readonly id: string; readonly role: NodeRole; readonly region: string; readonly endpoint: string; /** The node's key as it registered it; a server that asks for listed nodes checks a certificate's key against it */ readonly publicKey?: string }>;
     readonly owners: Readonly<Record<string, { readonly node: string; readonly epoch: number }>>;
     readonly keys: Readonly<Record<string, GrantKey>>;
 }
 
-/** The handshake: each end shows its certificate and signs the other's challenge */
-export type LinkHello = { type: 'link-hello'; nodeId: string; role: NodeRole; protocol: number; region: string; certificate: string; nonce: string };
-export type LinkWelcome = { type: 'link-welcome'; nodeId: string; certificate: string; nonce: string; proof: string; directory: DirectoryView };
+/**
+ * The handshake: each end shows its certificate and its share of the link's key, and signs the other's challenge with
+ * both shares (`transcript`). These go in the clear; everything after `link-proof` is sealed (`sealOf`), and the
+ * first sealed frame, from the server, starts with the directory
+ */
+export type LinkHello = { type: 'link-hello'; nodeId: string; role: NodeRole; protocol: number; region: string; certificate: string; nonce: string; share: string };
+export type LinkWelcome = { type: 'link-welcome'; nodeId: string; certificate: string; nonce: string; proof: string; share: string };
 export type LinkProof = { type: 'link-proof'; proof: string };
 export type LinkRefused = { type: 'link-refused'; reason: string };
 
@@ -38,6 +42,9 @@ export type MeshMessage =
     | { type: 'written'; wid: number; outcome: WriteOutcome }
     | { type: 'credit'; amount: number }
     | { type: 'directory'; directory: DirectoryView }
+    /** A node asks for a certificate's next one (its own, or one a node below it asked for); none when it is refused */
+    | { type: 'certify'; rid: number; certificate: string }
+    | { type: 'certified'; rid: number; certificate?: string }
     /**
      * A session of a namespace the node at the other end owns, tunnelled for a view this node serves: `open` starts it,
      * `say` carries each sync message either way as its text, `shut` ends it from either end
@@ -59,7 +66,7 @@ export type MeshFrame = { type: 'frame'; messages: MeshMessage[] };
 
 export type LinkMessage = LinkHello | LinkWelcome | LinkProof | LinkRefused | MeshFrame | { type: 'ping' } | { type: 'pong' };
 
-/** Parses one WebSocket message of a link, or undefined when it is not one */
+/** Parses one message of a link (the WebSocket's in the handshake, the opened text after it), or undefined when it is not one */
 export function parseLinkMessage(data: unknown): LinkMessage | undefined {
     try {
         const text = typeof data === 'string' ? data : Buffer.isBuffer(data) ? data.toString('utf8') : Array.isArray(data) ? Buffer.concat(data as Buffer[]).toString('utf8') : Buffer.from(data as ArrayBuffer).toString('utf8');

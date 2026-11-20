@@ -1,7 +1,7 @@
 import type { Change } from '@punyts/state-sync';
 import { createAuthorityUpstream, createRelay, OwnerNode } from '@punyts/state-sync/authority';
 import type { Access, Authority, AuthorityConnection, AuthoritySession, ClaimPolicy, GrantKey, NamespaceHost, NodePeer, OwnershipStore, Placement, Relay, RelayListener, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
-import type { KeyPair } from './certificates.js';
+import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
 import { startMeshServer } from './MeshServer.js';
 import type { MeshServer } from './MeshServer.js';
 import { createMeshUpstream } from './MeshUpstream.js';
@@ -12,7 +12,8 @@ export interface PeerLinksOptions {
     readonly nodeId: string;
     readonly region?: string;
     readonly keys: KeyPair;
-    readonly certificate: string;
+    /** This node's certificate, or what gives its newest one */
+    readonly certificate: string | (() => string);
     readonly authorityPublicKey: string;
     /** The directory as it is now: a peer is linked at the endpoint it names, and only while it names one */
     readonly directory: () => DirectoryView;
@@ -185,7 +186,14 @@ export interface OwnerMeshOptions {
     readonly nodeId: string;
     readonly region?: string;
     readonly keys: KeyPair;
-    readonly certificate: string;
+    /** This node's certificate, or what gives its newest one */
+    readonly certificate: string | (() => string);
+    /** The roles whose nodes must be in the directory to link here (`MeshServerOptions.requireListed`) */
+    readonly requireListed?: readonly NodeRole[];
+    /** Reads the directory again for a node that is not listed yet (`MeshServerOptions.reread`) */
+    readonly reread?: () => Promise<void>;
+    /** Answers a node's ask for its next certificate (`MeshServerOptions.certify`) */
+    readonly certify?: (certificate: string, claims: NodeCertificateClaims, via: NodeCertificateClaims) => Promise<string | undefined>;
     readonly authorityPublicKey: string;
     /** Where ownership is kept (`PgOwnershipStore`) */
     readonly ownership: OwnershipStore;
@@ -273,6 +281,9 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
         },
         handoff: (address, to) => node.handoff(address, to),
         take: (address) => node.claim(address),
+        ...(options.requireListed === undefined ? {} : { requireListed: options.requireListed }),
+        ...(options.reread === undefined ? {} : { reread: options.reread }),
+        ...(options.certify === undefined ? {} : { certify: options.certify }),
         ...(options.listenHost === undefined ? {} : { host: options.listenHost }),
         port: options.port ?? 0,
         ...(options.tls === undefined ? {} : { tls: options.tls })

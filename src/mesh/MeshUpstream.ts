@@ -1,7 +1,9 @@
 import type { Change } from '@punyts/state-sync';
 import type { Access, AuthorityConnection, AuthoritySession, Handoff, RelayListener, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import WebSocket from 'ws';
-import { checkProof, newNonce, proveNode, verifyNodeCertificate } from './certificates.js';
+import { checkProof, mayLink, newNonce, proveNode, verifyNodeCertificate } from './certificates.js';
+import { newShare, sealOf, transcript } from './sealing.js';
+import type { LinkSeal } from './sealing.js';
 import type { KeyPair, NodeRole } from './certificates.js';
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
 import type { DirectoryView, LinkMessage, MeshMessage } from './protocol.js';
@@ -11,8 +13,16 @@ export interface MeshUpstreamOptions {
     readonly role: NodeRole;
     readonly region?: string;
     readonly keys: KeyPair;
-    readonly certificate: string;
+    /**
+     * This node's certificate. Given as text, the node asks its parent for the next one before it ends
+     * (`renewWithinMs`, `onCertificate`); given as a function, whoever gives it keeps it fresh
+     */
+    readonly certificate: string | (() => string);
     readonly authorityPublicKey: string;
+    /** How long before its certificate ends the node asks for the next one; a day by default */
+    readonly renewWithinMs?: number;
+    /** The node's next certificate, when its parent gave one: keep it for the next start */
+    readonly onCertificate?: (certificate: string) => void;
     /** The parents to link to, in order of preference; more are learned from the directory */
     readonly parents: readonly string[];
     /** Whether to try the nodes the directory names when the parents do not answer; true by default (a peer link to one node: false) */
@@ -59,6 +69,10 @@ export interface MeshUpstream extends Upstream {
     handoff(address: string): Promise<Handoff | undefined>;
     /** Asks the parent to claim a namespace; whether it did */
     take(address: string): Promise<boolean>;
+    /** The certificate this node shows now */
+    certificate(): string;
+    /** Asks the parent for a certificate's next one (this node's, or one a node below asked for); undefined when it gives none */
+    certify(certificate: string): Promise<string | undefined>;
     close(): void;
 }
 
@@ -66,7 +80,8 @@ export interface MeshUpstream extends Upstream {
  * A node's link up the mesh (docs/design/statenet-relays.md, "The mesh protocol"): it opens a link to its first parent
  * that answers, proves itself with its certificate and key, checks the parent's in turn, and learns the directory from
  * its `link-welcome`, so a relay needs no database credentials. Subscriptions and writes go up in frames; credits go up
- * as messages are taken. A silent or closed link is replaced by one to the next parent (from the list, then the
+ * as messages are taken. Everything after the handshake is sealed with the key the two ends agreed in it (`sealOf`), and
+ * a parent of a role this node does not link to is refused (`mayLink`). A silent or closed link is replaced by one to the next parent (from the list, then the
  * directory), and every subscription is made again from the revision it has, so nothing is missed; writes not yet
  * answered are sent again, and the owner applies each change id once
  */
@@ -96,8 +111,20 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     /** Claims and takes by id, each sent once the link is open; a dropped link answers those it sent with nothing */
     const claims = new Map<number, { address: string; sent: boolean; done: (handoff: Handoff | undefined) => void }>();
     const takes = new Map<number, { address: string; sent: boolean; done: (ok: boolean) => void }>();
+    const certifies = new Map<number, { certificate: string; sent: boolean; done: (certificate: string | undefined) => void }>();
+    /** What seals the open link's messages; undefined until its handshake is through */
+    let seal: LinkSeal | undefined;
+    /** The certificate as text, when this node renews it over its link */
+    let held = typeof options.certificate === 'string' ? options.certificate : undefined;
+    const certificateNow = (): string => held ?? (options.certificate as () => string)();
+    const renewWithinMs = options.renewWithinMs ?? 24 * 3_600_000;
+    let nextRenewal = 0;
     const sendAsks = (): void => {
         if (!ready) return;
+        for (const [rid, ask] of certifies) if (!ask.sent) {
+            ask.sent = true;
+            queue({ type: 'certify', rid, certificate: ask.certificate });
+        }
         for (const [cid, claim] of claims) if (!claim.sent) {
             claim.sent = true;
             queue({ type: 'claim', cid, address: claim.address });
@@ -117,8 +144,13 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         for (const text of tunnel.buffer.splice(0)) queue({ type: 'say', tid, text });
     };
 
+    /** A message of the handshake, in the clear */
     const send = (message: LinkMessage): void => {
         if (socket !== undefined && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+    };
+    /** A message of the open link, sealed */
+    const sendSealed = (message: LinkMessage): void => {
+        if (socket !== undefined && socket.readyState === WebSocket.OPEN && seal !== undefined) socket.send(seal.seal(JSON.stringify(message)));
     };
     const queue = (message: MeshMessage): void => {
         if (!ready) return;
@@ -127,9 +159,31 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             scheduled = true;
             queueMicrotask(() => {
                 scheduled = false;
-                if (ready && outbox.length > 0) send({ type: 'frame', messages: outbox.splice(0) });
+                if (ready && outbox.length > 0) sendSealed({ type: 'frame', messages: outbox.splice(0) });
             });
         }
+    };
+
+    const certify = (certificate: string): Promise<string | undefined> =>
+        new Promise((done) => {
+            if (closed) return done(undefined);
+            certifies.set(nextCid++, { certificate, sent: false, done });
+            sendAsks();
+        });
+
+    /** Asks for this node's next certificate when the one it holds ends soon; a refusal is asked again a minute later */
+    const renew = (): void => {
+        if (held === undefined || !ready || now() < nextRenewal) return;
+        const mine = verifyNodeCertificate(held, options.authorityPublicKey, now());
+        if (!mine.ok || mine.claims.expires - now() > renewWithinMs) return;
+        nextRenewal = now() + 60_000;
+        void certify(held).then((next) => {
+            const checked = verifyNodeCertificate(next, options.authorityPublicKey, now());
+            if (next === undefined || !checked.ok || checked.claims.nodeId !== options.nodeId || checked.claims.role !== options.role || checked.claims.publicKey !== options.keys.publicKey) return;
+            if (checked.claims.expires <= mine.claims.expires) return;
+            held = next;
+            options.onCertificate?.(next);
+        });
     };
 
     /** The parents to try, in order: the configured ones, then any other node the directory names */
@@ -198,6 +252,12 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 write?.done(message.outcome);
                 return;
             }
+            case 'certified': {
+                const done = certifies.get(message.rid)?.done;
+                certifies.delete(message.rid);
+                done?.(message.certificate);
+                return;
+            }
             case 'directory':
                 directory = message.directory;
                 options.onDirectory?.(message.directory);
@@ -240,6 +300,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     const dropped = (): void => {
         ready = false;
         socket = undefined;
+        seal = undefined;
         current = undefined;
         if (ping !== undefined) clearInterval(ping);
         ping = undefined;
@@ -257,6 +318,10 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             takes.delete(cid);
             take.done(false);
         }
+        for (const [rid, ask] of [...certifies]) if (ask.sent) {
+            certifies.delete(rid);
+            ask.done(undefined);
+        }
         if (closed) return;
         timer = setTimeout(connect, backoff(attempt++));
         (timer as { unref?: () => void }).unref?.();
@@ -269,43 +334,75 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         const url = list[attempt % Math.max(1, list.length)];
         if (url === undefined) return;
         const nonce = newNonce();
+        const mine = newShare();
         const link = new WebSocket(url);
         socket = link;
+        seal = undefined;
+        const refuse = (why: string): void => {
+            options.report?.(`Refused the parent at ${url}: ${why}`);
+            link.terminate();
+        };
+        // a parent that takes the socket and then says nothing is left for the next one
+        const handshake = setTimeout(() => {
+            if (link === socket && !ready) link.terminate();
+        }, Math.max(1_000, silenceMs));
+        (handshake as { unref?: () => void }).unref?.();
         link.on('open', () => {
-            send({ type: 'link-hello', nodeId: options.nodeId, role: options.role, protocol: MESH_PROTOCOL, region: options.region ?? '', certificate: options.certificate, nonce });
+            send({ type: 'link-hello', nodeId: options.nodeId, role: options.role, protocol: MESH_PROTOCOL, region: options.region ?? '', certificate: certificateNow(), nonce, share: mine.share });
         });
-        link.on('message', (data) => {
+        link.on('message', (data, isBinary) => {
             if (link !== socket) return;
             lastHeard = now();
-            const message = parseLinkMessage(data);
-            if (message === undefined) return;
-            if (message.type === 'link-welcome' && !ready) {
-                const checked = verifyNodeCertificate(message.certificate, options.authorityPublicKey, now());
-                if (!checked.ok || checked.claims.nodeId !== message.nodeId || !checkProof(nonce, message.proof, checked.claims.publicKey)) {
-                    options.report?.(`Refused the parent at ${url}: ${checked.ok ? 'it did not prove it holds its key' : checked.reason}`);
-                    link.terminate();
-                    return;
+            if (seal !== undefined) {
+                // past the handshake every message is sealed: one that does not open was changed, replayed or lost one before it
+                const text = isBinary ? seal.open(data) : undefined;
+                const sealed = text === undefined ? undefined : parseLinkMessage(text);
+                if (sealed === undefined) return refuse('a message on the link did not open');
+                if (sealed.type !== 'frame') return;
+                let messages = sealed.messages;
+                if (!ready) {
+                    // the parent's first frame starts with the directory: it let this node in
+                    const first = messages[0];
+                    if (first?.type !== 'directory') return refuse('it did not open the link with the directory');
+                    messages = messages.slice(1);
+                    directory = first.directory;
+                    options.onDirectory?.(first.directory);
+                    current = url;
+                    options.report?.(`Linked to the parent at ${url}`);
+                    opened();
+                    ping = setInterval(() => {
+                        if (now() - lastHeard > silenceMs) link.terminate();
+                        else {
+                            sendSealed({ type: 'ping' });
+                            renew();
+                        }
+                    }, Math.max(20, silenceMs / 3));
+                    (ping as { unref?: () => void }).unref?.();
+                    renew();
                 }
-                directory = message.directory;
-                options.onDirectory?.(message.directory);
-                send({ type: 'link-proof', proof: proveNode(message.nonce, options.keys.privateKey) });
-                current = url;
-                options.report?.(`Linked to the parent at ${url}`);
-                opened();
-                ping = setInterval(() => {
-                    if (now() - lastHeard > silenceMs) link.terminate();
-                    else send({ type: 'ping' });
-                }, Math.max(20, silenceMs / 3));
-                (ping as { unref?: () => void }).unref?.();
+                for (const each of messages) receive(each);
                 return;
             }
-            if (message.type === 'link-refused') {
-                options.report?.(`The parent at ${url} refused the link: ${message.reason}`);
+            const message = isBinary ? undefined : parseLinkMessage(data);
+            if (message === undefined) return;
+            if (message.type === 'link-welcome') {
+                const checked = verifyNodeCertificate(message.certificate, options.authorityPublicKey, now());
+                if (!checked.ok) return refuse(checked.reason);
+                if (checked.claims.nodeId !== message.nodeId) return refuse('its certificate is for another node');
+                if (!mayLink(options.role, checked.claims.role)) return refuse(`a node of role ${options.role} does not link to one of role ${checked.claims.role}`);
+                if (typeof message.nonce !== 'string' || typeof message.share !== 'string') return refuse('its welcome has no challenge or no share');
+                const facts = { diallerShare: mine.share, serverShare: message.share, dialler: options.nodeId, server: checked.claims.nodeId };
+                if (!checkProof(transcript('server', nonce, facts), message.proof, checked.claims.publicKey)) return refuse('it did not prove it holds its key');
+                const sealed = sealOf(mine, message.share, { dialler: nonce, server: message.nonce }, 'dialler');
+                if (sealed === undefined) return refuse('its share is not a key');
+                send({ type: 'link-proof', proof: proveNode(transcript('dialler', message.nonce, facts), options.keys.privateKey) });
+                seal = sealed;
                 return;
             }
-            if (message.type === 'frame' && ready) for (const each of message.messages) receive(each);
+            if (message.type === 'link-refused') options.report?.(`The parent at ${url} refused the link: ${message.reason}`);
         });
         link.on('close', () => {
+            clearTimeout(handshake);
             if (link === socket) dropped();
         });
         link.on('error', () => undefined);
@@ -366,6 +463,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 takes.set(nextCid++, { address, sent: false, done });
                 sendAsks();
             }),
+        certificate: certificateNow,
+        certify,
         close: () => {
             closed = true;
             for (const tunnel of tunnels.values()) tunnel.connection.close();
@@ -374,6 +473,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             claims.clear();
             for (const take of takes.values()) take.done(false);
             takes.clear();
+            for (const ask of certifies.values()) ask.done(undefined);
+            certifies.clear();
             if (timer !== undefined) clearTimeout(timer);
             if (ping !== undefined) clearInterval(ping);
             socket?.terminate();

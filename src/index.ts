@@ -2,7 +2,9 @@ export * from "./FileNamespaceStorage.js";
 export * from "./loopback.js";
 export * from "./Statenet.js";
 /** The mesh of owner nodes and relays (docs/design/statenet-relays.md, S6) */
-export { checkProof, generateKeyPair, issueNodeCertificate, newNonce, proveNode, verifyNodeCertificate } from "./mesh/certificates.js";
+export { checkProof, generateKeyPair, issueNodeCertificate, mayLink, newNonce, proveNode, renewNodeCertificate, verifyNodeCertificate } from "./mesh/certificates.js";
+export { newShare, sealOf, transcript } from "./mesh/sealing.js";
+export type { LinkSeal, LinkShare } from "./mesh/sealing.js";
 export type { KeyPair, NodeCertificateClaims, NodeRole } from "./mesh/certificates.js";
 export { MESH_PROTOCOL, parseLinkMessage } from "./mesh/protocol.js";
 export type { DirectoryView, LinkMessage, MeshFrame, MeshMessage } from "./mesh/protocol.js";
