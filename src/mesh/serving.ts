@@ -2,7 +2,7 @@ import type { Change, RevisedChange } from '@punyts/state-sync';
 import type { Access, Authority, AuthorityConnection, AuthoritySession, Handoff, RelayBatch, RelaySubscription, StoredNamespace, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import { verifyNodeCertificate } from './certificates.js';
 import type { NodeCertificateClaims } from './certificates.js';
-import type { LoadOutcome, MeshMessage, PersistOutcome } from './protocol.js';
+import type { LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 
 /** Applies a write that came over a link: `via` is the node at the other end */
 export type MeshWriter = (address: string, change: Change, access?: Access, via?: string) => Promise<WriteOutcome>;
@@ -51,6 +51,7 @@ export interface ServingOptions {
      */
     readonly persist?: (address: string, stored: StoredNamespace, epoch: number, node: string) => Promise<PersistOutcome>;
     readonly load?: (address: string, node: string) => Promise<LoadOutcome>;
+    readonly remove?: (address: string, epoch: number, node: string) => Promise<RemoveOutcome>;
     /**
      * Answers a node's ask for a certificate's next one: `certificate` is one the authority signed and has not ended,
      * `claims` what it says, `via` the node on the link (the node itself, or a relay that passes the ask up).
@@ -284,6 +285,13 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                 const failed = (reason: string): LoadOutcome => ({ ok: false, reason });
                 const outcome = options.load === undefined ? failed(`${options.nodeId} keeps nothing for other nodes`) : await options.load(message.address, node).catch((error: unknown) => failed(error instanceof Error ? error.message : String(error)));
                 push({ type: 'loaded', lid: message.lid, outcome });
+                return;
+            }
+            case 'remove': {
+                const node = peer.role === 'relay' && typeof message.node === 'string' ? message.node : peer.nodeId;
+                const failed = (reason: string): RemoveOutcome => ({ result: 'failed', reason });
+                const outcome = options.remove === undefined ? failed(`${options.nodeId} keeps nothing for other nodes`) : await options.remove(message.address, message.epoch, node).catch((error: unknown) => failed(error instanceof Error ? error.message : String(error)));
+                push({ type: 'removed', lid: message.lid, outcome });
                 return;
             }
             case 'certify': {

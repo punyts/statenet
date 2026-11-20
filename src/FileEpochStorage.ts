@@ -1,8 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { FencedError } from "@punyts/state-sync/authority";
 import type { EpochStorage } from "@punyts/state-sync/authority";
-import { createFileNamespaceStorage } from "./FileNamespaceStorage.js";
+import { createFileNamespaceStorage, NAMESPACE_FILE } from "./FileNamespaceStorage.js";
 import type { FileNamespaceStorageOptions } from "./FileNamespaceStorage.js";
 
 /** The file beside a namespace's that keeps the newest epoch it was saved under */
@@ -14,7 +14,7 @@ export const EPOCH_FILE = "epoch.json";
  * slashes, and beside it the newest epoch it was saved under. A save under an older epoch is refused with
  * `FencedError`. The saves of one address run one at a time
  */
-export const createFileEpochStorage = (options: FileNamespaceStorageOptions): EpochStorage => {
+export const createFileEpochStorage = (options: FileNamespaceStorageOptions): EpochStorage & { remove(address: string, epoch?: number): Promise<void> } => {
     const files = createFileNamespaceStorage(options);
     const queues = new Map<string, Promise<void>>();
     const nameOf = (address: string): string => address.split("/").join(".");
@@ -31,6 +31,16 @@ export const createFileEpochStorage = (options: FileNamespaceStorageOptions): Ep
 
     return {
         load: (address) => files.load(nameOf(address)),
+        // the namespace's file goes, after the saves that came before; its epoch stays, so an older owner stays refused
+        remove: (address, epoch) => {
+            const turn = (queues.get(address) ?? Promise.resolve()).then(async () => {
+                const current = await epochOf(address);
+                if (epoch !== undefined && epoch < current) throw new FencedError(address, epoch, current);
+                await rm(join(options.dataDir, nameOf(address), NAMESPACE_FILE), { force: true });
+            });
+            queues.set(address, turn.catch(() => undefined));
+            return turn;
+        },
         save: (address, stored, epoch) => {
             const turn = (queues.get(address) ?? Promise.resolve()).then(async () => {
                 const current = await epochOf(address);

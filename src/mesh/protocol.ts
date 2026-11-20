@@ -19,6 +19,9 @@ export interface DirectoryView {
 /** An aggregate's answer to a save: it landed (up to `revision`), a newer epoch holds the namespace, or it failed */
 export type PersistOutcome = { result: 'saved'; revision: number } | { result: 'fenced'; epoch: number; current: number } | { result: 'failed'; reason: string };
 
+/** An aggregate's answer to a removal: the namespace is gone, a newer epoch holds it, or it failed */
+export type RemoveOutcome = { result: 'removed' } | { result: 'fenced'; epoch: number; current: number } | { result: 'failed'; reason: string };
+
 /** An aggregate's answer to a load: the stored namespace (none when nothing is stored), or why not */
 export type LoadOutcome = { ok: true; stored?: StoredNamespace } | { ok: false; reason: string };
 
@@ -62,6 +65,9 @@ export type MeshMessage =
     | { type: 'persisted'; pid: number; outcome: PersistOutcome }
     | { type: 'load'; lid: number; address: string; node?: string }
     | { type: 'loaded'; lid: number; outcome: LoadOutcome }
+    /** A node has its namespace removed whole (a reset, a deleted app), under the epoch it holds it under */
+    | { type: 'remove'; lid: number; address: string; epoch: number; node?: string }
+    | { type: 'removed'; lid: number; outcome: RemoveOutcome }
     /** A node asks for a certificate's next one (its own, or one a node below it asked for); none when it is refused */
     | { type: 'certify'; rid: number; certificate: string }
     | { type: 'certified'; rid: number; certificate?: string }

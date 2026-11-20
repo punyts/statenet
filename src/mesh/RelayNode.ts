@@ -116,6 +116,7 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         // and keeps nothing: what a node below sends to be saved goes on up, toward an aggregate
         persist: (address, stored, epoch, node) => upstream.persist(address, stored, epoch, node),
         load: (address, node) => upstream.load(address, node),
+        remove: (address, epoch, node) => upstream.remove(address, epoch, node),
         upstream: relay,
         write: (address, change, access) => upstream.write(address, change, access),
         route,

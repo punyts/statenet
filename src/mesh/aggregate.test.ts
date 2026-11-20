@@ -179,6 +179,50 @@ describe('the aggregate', () => {
     });
 });
 
+describe('removing a namespace', () => {
+    it('should remove it after the saves that came before, refuse an older epoch, and take a save again after', async () => {
+        // Arrange
+        const dataDir = await mkdtemp(join(tmpdir(), 'statenet-remove-'));
+        closers.push(() => rm(dataDir, { recursive: true, force: true }));
+        const files = createFileEpochStorage({ dataDir });
+        const aggregate = createAggregate(files);
+
+        // Act
+        const saving = aggregate.persist(ADDRESS, stored(4), 2);
+        const older = await aggregate.remove(ADDRESS, 1);
+        const removed = await aggregate.remove(ADDRESS, 2);
+        const gone = await files.load(ADDRESS);
+        const late = await aggregate.persist(ADDRESS, stored(5), 1);
+        const again = await aggregate.persist(ADDRESS, stored(1), 2);
+
+        // Assert
+        expect(await saving).toEqual({ result: 'saved', revision: 4 });
+        expect(older).toEqual({ result: 'fenced', epoch: 1, current: 2 });
+        expect(removed).toEqual({ result: 'removed' });
+        expect(gone).toBeUndefined();
+        expect(late).toEqual({ result: 'fenced', epoch: 1, current: 2 });
+        expect(again).toEqual({ result: 'saved', revision: 1 });
+        expect((await files.load(ADDRESS))?.revision).toBe(1);
+    });
+
+    it('should say so when its storage removes nothing, and remove over a relay for the node that asks', async () => {
+        // Arrange
+        const memory = createMemoryEpochStorage();
+        const removed: string[] = [];
+        const { link } = await chain({ load: (address) => memory.load(address), save: (address, value, epoch) => memory.save(address, value, epoch), remove: async (address: string) => void removed.push(address) } as EpochStorage);
+        const plain = createAggregate(memory);
+        await createAggregateStorage(link).save(ADDRESS, stored(1), 1);
+
+        // Act
+        const unable = await plain.remove(ADDRESS, 1);
+        await createAggregateStorage(link).remove(ADDRESS, 1);
+
+        // Assert
+        expect(unable).toEqual({ result: 'failed', reason: "this aggregate's storage removes nothing" });
+        expect(removed).toEqual([ADDRESS]);
+    });
+});
+
 describe('a node that saves through an aggregate', () => {
     it('should call a change durable only once the aggregate saved it', async () => {
         // Arrange: a node in the same process as its aggregate

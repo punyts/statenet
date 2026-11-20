@@ -10,7 +10,7 @@ import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js
 import { createLinkClient } from './linkClient.js';
 import type { LinkClient } from './linkClient.js';
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
-import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome } from './protocol.js';
+import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 import { newShare, sealOf, transcript } from './sealing.js';
 import type { LinkSeal } from './sealing.js';
 import { createServing } from './serving.js';
@@ -40,6 +40,8 @@ export interface MeshServerOptions {
      */
     readonly persist?: (address: string, stored: StoredNamespace, epoch: number, node: string) => Promise<PersistOutcome>;
     readonly load?: (address: string, node: string) => Promise<LoadOutcome>;
+    /** Removes a namespace a node below asks to have removed: an aggregate's own, or a relay's link up to one */
+    readonly remove?: (address: string, epoch: number, node: string) => Promise<RemoveOutcome>;
     /** Reads the directory again, for a node that says hello and is not listed: it may have registered a moment ago */
     readonly reread?: () => Promise<void>;
     /**

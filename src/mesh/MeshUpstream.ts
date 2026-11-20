@@ -9,7 +9,7 @@ import type { RouteTarget, Serving, ServingOptions } from './serving.js';
 import type { NodeCertificateClaims } from './certificates.js';
 import type { KeyPair, NodeRole } from './certificates.js';
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
-import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome } from './protocol.js';
+import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 
 export interface MeshUpstreamOptions {
     readonly nodeId: string;
@@ -96,6 +96,8 @@ export interface MeshUpstream extends Upstream {
     persist(address: string, stored: StoredNamespace, epoch: number, node?: string): Promise<PersistOutcome>;
     /** Loads a namespace from the aggregate; asked again on the next link when this one drops */
     load(address: string, node?: string): Promise<LoadOutcome>;
+    /** Has the aggregate remove a namespace whole, under the epoch this node holds it under; asked again on the next link */
+    remove(address: string, epoch: number, node?: string): Promise<RemoveOutcome>;
     /** Asks the parent for a certificate's next one (this node's, or one a node below asked for); undefined when it gives none */
     certify(certificate: string): Promise<string | undefined>;
     close(): void;
@@ -163,6 +165,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     const persists = new Map<number, { address: string; stored: StoredNamespace; epoch: number; node?: string; done: (outcome: PersistOutcome) => void }>();
     const loads = new Map<number, { address: string; node?: string; done: (outcome: LoadOutcome) => void }>();
     const persistMessage = (pid: number, save: { address: string; stored: StoredNamespace; epoch: number; node?: string }): MeshMessage => ({ type: 'persist', pid, address: save.address, epoch: save.epoch, stored: save.stored, ...(save.node === undefined ? {} : { node: save.node }) });
+    const removals = new Map<number, { address: string; epoch: number; node?: string; done: (outcome: RemoveOutcome) => void }>();
+    const removeMessage = (lid: number, removal: { address: string; epoch: number; node?: string }): MeshMessage => ({ type: 'remove', lid, address: removal.address, epoch: removal.epoch, ...(removal.node === undefined ? {} : { node: removal.node }) });
     const loadMessage = (lid: number, load: { address: string; node?: string }): MeshMessage => ({ type: 'load', lid, address: load.address, ...(load.node === undefined ? {} : { node: load.node }) });
     /** What seals the open link's messages; undefined until its handshake is through */
     let seal: LinkSeal | undefined;
@@ -252,6 +256,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         for (const tid of tunnels.keys()) openTunnel(tid);
         for (const [pid, save] of persists) queue(persistMessage(pid, save));
         for (const [lid, load] of loads) queue(loadMessage(lid, load));
+        for (const [lid, removal] of removals) queue(removeMessage(lid, removal));
         sendAsks();
     };
 
@@ -315,6 +320,12 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             case 'loaded': {
                 const done = loads.get(message.lid)?.done;
                 loads.delete(message.lid);
+                done?.(message.outcome);
+                return;
+            }
+            case 'removed': {
+                const done = removals.get(message.lid)?.done;
+                removals.delete(message.lid);
                 done?.(message.outcome);
                 return;
             }
@@ -551,6 +562,14 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 persists.set(pid, save);
                 queue(persistMessage(pid, save));
             }),
+        remove: (address, epoch, node) =>
+            new Promise((done) => {
+                if (closed) return done({ result: 'failed', reason: 'the link is closed' });
+                const lid = nextCid++;
+                const removal = { address, epoch, ...(node === undefined ? {} : { node }), done };
+                removals.set(lid, removal);
+                queue(removeMessage(lid, removal));
+            }),
         load: (address, node) =>
             new Promise((done) => {
                 if (closed) return done({ ok: false, reason: 'the link is closed' });
@@ -573,6 +592,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             persists.clear();
             for (const load of loads.values()) load.done({ ok: false, reason: 'the link is closed' });
             loads.clear();
+            for (const removal of removals.values()) removal.done({ result: 'failed', reason: 'the link is closed' });
+            removals.clear();
             if (timer !== undefined) clearTimeout(timer);
             if (ping !== undefined) clearInterval(ping);
             socket?.terminate();

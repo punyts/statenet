@@ -3,7 +3,10 @@ import type { EpochStorage, StoredNamespace, Upstream } from '@punyts/state-sync
 import type { KeyPair, NodeRole } from './certificates.js';
 import { startMeshServer } from './MeshServer.js';
 import type { MeshServer, MeshServerOptions } from './MeshServer.js';
-import type { DirectoryView, LoadOutcome, PersistOutcome } from './protocol.js';
+import type { DirectoryView, LoadOutcome, PersistOutcome, RemoveOutcome } from './protocol.js';
+
+/** An aggregate's storage: namespaces under epochs, and, where it can, removing one whole */
+export type AggregateStorageBackend = EpochStorage & { remove?(address: string, epoch?: number): Promise<void> };
 
 /**
  * What saves and loads namespaces for a node: an aggregate in the same process, or a node's link up the mesh to one
@@ -12,6 +15,8 @@ import type { DirectoryView, LoadOutcome, PersistOutcome } from './protocol.js';
 export interface AggregateLink {
     persist(address: string, stored: StoredNamespace, epoch: number, node?: string): Promise<PersistOutcome>;
     load(address: string, node?: string): Promise<LoadOutcome>;
+    /** Removes a namespace whole, for the node that holds it under `epoch` */
+    remove(address: string, epoch: number, node?: string): Promise<RemoveOutcome>;
 }
 
 export interface AggregateOptions {
@@ -48,6 +53,8 @@ interface Lane {
     /** The save that goes next, with everyone waiting on it: a later save of the namespace replaces it */
     next?: { stored: StoredNamespace; epoch: number; waiters: Waiter[] };
     running: boolean;
+    /** The saves under way, for a removal to wait out */
+    work?: Promise<void>;
 }
 
 /**
@@ -58,7 +65,7 @@ interface Lane {
  * after a dropped link); a save under an older epoch is answered `fenced` and writes nothing, by this aggregate's own
  * count or by the storage's, which is the one that holds across aggregates
  */
-export function createAggregate(storage: EpochStorage, options: AggregateOptions = {}): Aggregate {
+export function createAggregate(storage: AggregateStorageBackend, options: AggregateOptions = {}): Aggregate {
     const lanes = new Map<string, Lane>();
     let saves = 0;
     let folded = 0;
@@ -131,8 +138,29 @@ export function createAggregate(storage: EpochStorage, options: AggregateOptions
                     if (stored.revision >= next.stored.revision) next.stored = stored;
                     next.waiters.push(waiter);
                 }
-                void run(address, held);
+                held.work = run(address, held);
             });
+        },
+        remove: async (address, epoch, node) => {
+            if (options.mayPersist !== undefined && !(await options.mayPersist(address, node, epoch))) return { result: 'failed', reason: `${node ?? 'this node'} does not order ${address}` };
+            if (storage.remove === undefined) return { result: 'failed', reason: 'this aggregate\'s storage removes nothing' };
+            let lane = lanes.get(address);
+            if (lane === undefined) lanes.set(address, (lane = { running: false }));
+            // after the saves that came before it, so none of them lands on what was removed
+            while (lane.running || lane.next !== undefined) await lane.work;
+            if (lane.head !== undefined && epoch < lane.head.epoch) return fence(epoch, lane.head.epoch) as RemoveOutcome;
+            try {
+                await storage.remove(address, epoch);
+            } catch (error) {
+                if (error instanceof FencedError) {
+                    lane.head = { revision: lane.head?.revision ?? 0, epoch: Math.max(error.current, lane.head?.epoch ?? 0) };
+                    return fence(epoch, error.current) as RemoveOutcome;
+                }
+                return { result: 'failed', reason: error instanceof Error ? error.message : String(error) };
+            }
+            // what landed is gone, and a save from before the removal's epoch stays refused
+            lane.head = { revision: 0, epoch: Math.max(epoch, lane.head?.epoch ?? 0) };
+            return { result: 'removed' };
         },
         load: async (address) => {
             try {
@@ -152,8 +180,13 @@ export function createAggregate(storage: EpochStorage, options: AggregateOptions
  * fences throws `FencedError`, so the node stops ordering the namespace. `node` is the node's own id, for an
  * aggregate that checks who orders what
  */
-export function createAggregateStorage(link: AggregateLink, node?: string): EpochStorage {
+export function createAggregateStorage(link: AggregateLink, node?: string): EpochStorage & { remove(address: string, epoch?: number): Promise<void> } {
     return {
+        remove: async (address, epoch = 0) => {
+            const outcome = await link.remove(address, epoch, node);
+            if (outcome.result === 'fenced') throw new FencedError(address, outcome.epoch, outcome.current);
+            if (outcome.result === 'failed') throw new Error(`Removing ${address} at the aggregate failed: ${outcome.reason}`);
+        },
         load: async (address) => {
             const outcome = await link.load(address, node);
             if (!outcome.ok) throw new Error(`Loading ${address} from the aggregate failed: ${outcome.reason}`);
@@ -173,7 +206,7 @@ export interface AggregateNodeOptions extends AggregateOptions {
     readonly certificate: string | (() => string);
     readonly authorityPublicKey: string;
     /** Where the namespaces are kept: Postgres, files, memory */
-    readonly storage: EpochStorage;
+    readonly storage: AggregateStorageBackend;
     /** The directory the relays below learn; empty by default */
     readonly directory?: () => DirectoryView;
     readonly host?: string;
@@ -221,6 +254,7 @@ export async function startAggregateNode(options: AggregateNodeOptions): Promise
         directory: options.directory ?? (() => EMPTY),
         persist: (address, stored, epoch, node) => aggregate.persist(address, stored, epoch, node),
         load: (address, node) => aggregate.load(address, node),
+        remove: (address, epoch, node) => aggregate.remove(address, epoch, node),
         ...(options.host === undefined ? {} : { host: options.host }),
         port: options.port ?? 0,
         ...(options.tls === undefined ? {} : { tls: options.tls }),
