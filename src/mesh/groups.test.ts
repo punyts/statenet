@@ -1,0 +1,282 @@
+import { createStore } from '@punyts/state';
+import { createStoreBridge, createSyncClient } from '@punyts/state-sync';
+import type { Change, JsonValue, SyncTransport } from '@punyts/state-sync';
+import { createAuthority, createMemoryEpochStorage, createMemoryOwnershipStore } from '@punyts/state-sync/authority';
+import type { Authority, AuthoritySession, EpochStorage, NamespaceHost, OwnershipStore, RelayListener } from '@punyts/state-sync/authority';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createAggregateStorage, startAggregateNode } from './Aggregate.js';
+import { generateKeyPair, issueNodeCertificate } from './certificates.js';
+import type { NodeRole } from './certificates.js';
+import { createMeshUpstream } from './MeshUpstream.js';
+import { startOwnerMesh } from './OwnerMesh.js';
+import type { OwnerMesh } from './OwnerMesh.js';
+import type { DirectoryView } from './protocol.js';
+import { startRelayNode } from './RelayNode.js';
+import type { RelayNode } from './RelayNode.js';
+
+const HOUR = 3_600_000;
+const ADDRESS = 'alice/notes/user';
+const NAMESPACE = 'alice_notes_user';
+const ca = generateKeyPair();
+const closers: Array<() => Promise<void> | void> = [];
+
+afterEach(async () => {
+    for (const close of closers.splice(0).reverse()) await close();
+});
+
+let counter = 0;
+const change = (path: string, value: unknown): Change => ({ id: `g${++counter}`, path, op: 'set', value: value as never, base: 0 });
+
+const certificate = (nodeId: string, role: NodeRole, publicKey: string, group?: string): string =>
+    issueNodeCertificate({ nodeId, role, region: '', publicKey, expires: Date.now() + HOUR, ...(group === undefined ? {} : { group }) }, ca.privateKey);
+
+/** A node's authorities over a storage: one shared by the servers, or each node's way to the aggregate */
+function hostOver(storageOf: () => EpochStorage) {
+    const running = new Map<string, Promise<Authority>>();
+    const host: NamespaceHost = {
+        authority: (address, epoch) => {
+            let found = running.get(address);
+            if (found === undefined) {
+                const storage = storageOf();
+                found = createAuthority({ namespace: NAMESPACE, storage: { load: () => storage.load(address), save: (_namespace, stored) => storage.save(address, stored, epoch) }, initial: { data: {} }, createParents: true });
+                running.set(address, found);
+            }
+            return found;
+        },
+        release: async (address) => {
+            const found = running.get(address);
+            running.delete(address);
+            (await found)?.close();
+        }
+    };
+    return host;
+}
+
+interface Placed {
+    readonly id: string;
+    readonly group: string;
+    readonly relay: string;
+}
+
+/**
+ * An aggregate, a relay per group linked to it, and nodes each linked up to its group's relay: nodes of one group also
+ * link to each other. `throughAggregate` has the nodes save through their relay to the aggregate; otherwise they share
+ * a storage, as servers on one database do
+ */
+async function statenet(placed: readonly Placed[], throughAggregate = false) {
+    const ownership: OwnershipStore = createMemoryOwnershipStore();
+    const database = createMemoryEpochStorage();
+    const entries: Array<DirectoryView['nodes'][number]> = [];
+    const directory = (): DirectoryView => ({ nodes: entries, owners: {}, keys: {} });
+    const aggregateKeys = generateKeyPair();
+    const aggregate = await startAggregateNode({ nodeId: 'aggregate', keys: aggregateKeys, certificate: certificate('aggregate', 'aggregate', aggregateKeys.publicKey), authorityPublicKey: ca.publicKey, storage: database, directory });
+    closers.push(() => aggregate.close());
+    const relays = new Map<string, RelayNode>();
+    for (const id of new Set(placed.map((node) => node.relay))) {
+        const keys = generateKeyPair();
+        const relay = await startRelayNode({ nodeId: id, keys, certificate: certificate(id, 'relay', keys.publicKey), authorityPublicKey: ca.publicKey, parents: [aggregate.url], checkGrants: false, upstream: { renewWithinMs: 0, followDirectory: false } });
+        relays.set(id, relay);
+        entries.push({ id, role: 'relay', region: '', endpoint: relay.meshUrl });
+        closers.push(() => relay.close());
+    }
+    const nodes = new Map<string, OwnerMesh>();
+    for (const { id, group, relay } of placed) {
+        const keys = generateKeyPair();
+        let mesh: OwnerMesh | undefined;
+        const host = hostOver(() => (throughAggregate && mesh?.uplink !== undefined ? createAggregateStorage(mesh.uplink) : database));
+        mesh = await startOwnerMesh({
+            nodeId: id,
+            group,
+            keys,
+            certificate: certificate(id, 'owner', keys.publicKey, group),
+            authorityPublicKey: ca.publicKey,
+            ownership,
+            host,
+            directory,
+            relays: [(relays.get(relay) as RelayNode).meshUrl],
+            leaseMs: 10_000,
+            writeTimeoutMs: 3_000
+        });
+        const made = mesh;
+        entries.push({ id, role: 'owner', region: '', endpoint: made.url, group, parent: relay });
+        nodes.set(id, made);
+        closers.push(() => made.close());
+    }
+    // every relay knows the nodes and where each is linked, from the aggregate's directory
+    aggregate.mesh.directoryChanged();
+    await vi.waitFor(() => {
+        for (const node of nodes.values()) expect(node.uplink?.linked()).toBe(true);
+        for (const relay of relays.values()) expect(relay.upstream.directory()?.nodes).toHaveLength(entries.length);
+    });
+    return { nodes: (id: string) => nodes.get(id) as OwnerMesh, relays: (id: string) => relays.get(id) as RelayNode, aggregate, database, ownership };
+}
+
+/** A view: a sync client whose connection is a session a node gives it, here or tunnelled to the owner */
+function view(node: OwnerMesh) {
+    const store = createStore({});
+    const transport: SyncTransport = {
+        connect: (handlers) => {
+            let session: AuthoritySession | undefined;
+            const waiting: string[] = [];
+            let gone = false;
+            void node
+                .connect(ADDRESS, { send: (text) => handlers.onMessage(text), close: () => !gone && ((gone = true), handlers.onClose()) }, undefined, async () => (await node.node.authorityOf(ADDRESS)) as Authority)
+                .then((made) => {
+                    session = made;
+                    handlers.onOpen();
+                    for (const text of waiting.splice(0)) made.receive(text);
+                }, () => !gone && ((gone = true), handlers.onClose()));
+            return {
+                send: (text) => (session === undefined ? waiting.push(text) : session.receive(text)),
+                close: () => {
+                    gone = true;
+                    session?.close();
+                }
+            };
+        }
+    };
+    const client = createSyncClient({ namespace: NAMESPACE, bridge: createStoreBridge(store), transport, backoff: () => 20 });
+    client.start();
+    closers.push(() => client.stop());
+    return { store, client };
+}
+
+const TWO_GROUPS: readonly Placed[] = [
+    { id: 'a1', group: 'a', relay: 'relay-a' },
+    { id: 'b1', group: 'b', relay: 'relay-b' }
+];
+
+describe('nodes in groups', () => {
+    it('should refuse a node of another group that links to a node directly, at either end', async () => {
+        // Arrange
+        const { nodes } = await statenet(TWO_GROUPS);
+        const said: string[] = [];
+        const keys = generateKeyPair();
+
+        // Act: a node of group a dials b1
+        const honest = createMeshUpstream({ nodeId: 'a2', role: 'owner', group: 'a', keys, certificate: certificate('a2', 'owner', keys.publicKey, 'a'), authorityPublicKey: ca.publicKey, parents: [nodes('b1').url], followDirectory: false, backoff: () => 5_000, report: (line) => said.push(line) });
+        closers.push(() => honest.close());
+        await vi.waitFor(() => expect(said.length).toBeGreaterThan(0));
+
+        // Assert
+        expect(honest.linked()).toBe(false);
+        expect(said.join('\n')).toContain('a node of group a does not link to a node of group b');
+        expect(nodes('b1').mesh.stats().links).toEqual([]);
+    });
+
+    it('should link the nodes of one group to each other directly', async () => {
+        // Arrange
+        const { nodes } = await statenet([
+            { id: 'a1', group: 'a', relay: 'relay-a' },
+            { id: 'a2', group: 'a', relay: 'relay-a' }
+        ]);
+        await nodes('a1').node.write(ADDRESS, change('$.data.first', 1));
+
+        // Act
+        const outcome = await nodes('a2').node.write(ADDRESS, change('$.data.second', 2));
+
+        // Assert
+        expect(outcome).toMatchObject({ result: 'applied' });
+        expect(nodes('a1').mesh.stats().links.map((link) => link.nodeId)).toEqual(['a2']);
+        expect((await nodes('a1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ first: 1, second: 2 });
+    });
+
+    it('should carry a write to a node of another group through their relays, where it is applied once', async () => {
+        // Arrange
+        const { nodes, relays } = await statenet(TWO_GROUPS);
+        await nodes('b1').node.write(ADDRESS, change('$.data.first', 1));
+
+        // Act
+        const outcome = await nodes('a1').node.write(ADDRESS, change('$.data.second', 2));
+
+        // Assert
+        expect(outcome).toMatchObject({ result: 'applied', epoch: 1 });
+        expect(nodes('a1').node.owned()).toEqual([]);
+        expect((await nodes('b1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ first: 1, second: 2 });
+        expect(nodes('b1').mesh.stats().links).toEqual([]);
+        expect(relays('relay-b').mesh.stats().links.map((link) => link.nodeId).sort()).toEqual(['b1', 'relay-a']);
+    });
+
+    it('should tunnel a view to the owner in another group through the relays, with its writes', async () => {
+        // Arrange
+        const { nodes } = await statenet(TWO_GROUPS);
+        await nodes('b1').node.write(ADDRESS, change('$.data.title', 'from b'));
+        const atA = view(nodes('a1'));
+        await vi.waitFor(() => expect(atA.client.status().status).toBe('online'));
+
+        // Act
+        atA.store.set('$.data.fromA', true);
+
+        // Assert
+        await vi.waitFor(async () => expect((await nodes('b1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ title: 'from b', fromA: true }));
+        expect(atA.store.get('$.data.title')).toBe('from b');
+        expect(nodes('b1').node.owned()).toEqual([ADDRESS]);
+    });
+
+    it('should serve a subscription to a namespace another group owns through the relays', async () => {
+        // Arrange
+        const { nodes } = await statenet(TWO_GROUPS);
+        await nodes('b1').node.write(ADDRESS, change('$.data.n', 0));
+        const seen: { value: JsonValue | undefined } = { value: undefined };
+        const listener: RelayListener = {
+            welcome: (welcome) => {
+                if ('value' in welcome) seen.value = structuredClone(welcome.value);
+            },
+            changes: (batch) => {
+                for (const one of batch.changes) if (one.path === '$.data.n') (seen.value as { data: { n: unknown } }).data.n = one.value;
+            }
+        };
+
+        // Act
+        nodes('a1').relay.subscribe(ADDRESS, '$', undefined, listener, { subject: 'a1' });
+        await vi.waitFor(() => expect(seen.value).toEqual({ data: { n: 0 } }));
+        await nodes('b1').node.write(ADDRESS, change('$.data.n', 1));
+
+        // Assert
+        await vi.waitFor(() => expect(seen.value).toEqual({ data: { n: 1 } }));
+    });
+
+    it('should move a namespace to a node of another group by a claim through the relays', async () => {
+        // Arrange
+        const { nodes, ownership } = await statenet(TWO_GROUPS);
+        await nodes('b1').node.write(ADDRESS, change('$.data.n', 1));
+
+        // Act
+        const claimed = await nodes('a1').node.claim(ADDRESS);
+        const after = await nodes('b1').node.write(ADDRESS, change('$.data.m', 2));
+
+        // Assert
+        expect(claimed).toBe(true);
+        expect((await ownership.get(ADDRESS))?.node).toBe('a1');
+        expect(after).toMatchObject({ result: 'applied' });
+        expect(nodes('a1').node.owned()).toEqual([ADDRESS]);
+        expect((await nodes('a1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ n: 1, m: 2 });
+    });
+
+    it('should reject a write for a node the relays know no way to', async () => {
+        // Arrange
+        const { nodes } = await statenet(TWO_GROUPS);
+
+        // Act
+        const outcome = await nodes('a1').uplink?.write(ADDRESS, change('$.data.n', 1), undefined, 'nowhere');
+
+        // Assert
+        expect(outcome).toEqual({ result: 'rejected', reason: 'node nowhere cannot be reached from relay-a' });
+    });
+
+    it('should save what a node orders through its relay to the aggregate, and load it at the node that takes it over', async () => {
+        // Arrange
+        const { nodes, database, aggregate } = await statenet(TWO_GROUPS, true);
+
+        // Act
+        await nodes('a1').node.write(ADDRESS, change('$.data.n', 1));
+        await (await nodes('a1').node.authorityOf(ADDRESS))?.whenDurable();
+        const claimed = await nodes('b1').node.claim(ADDRESS);
+
+        // Assert
+        expect((await database.load(ADDRESS))?.state).toEqual({ data: { n: 1 } });
+        expect(aggregate.aggregate.stats().saves).toBeGreaterThan(0);
+        expect(claimed).toBe(true);
+        expect((await nodes('b1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ n: 1 });
+    });
+});

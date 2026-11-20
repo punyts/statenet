@@ -17,6 +17,11 @@ export interface NodeCertificateClaims {
     readonly nodeId: string;
     readonly role: NodeRole;
     readonly region: string;
+    /**
+     * The group of a node (`owner`): the nodes that run together, on one server or in one stack behind one relay
+     * (docs/design/statenet-network.md, "Groups"). Nodes link to each other only inside a group
+     */
+    readonly group?: string;
     /** The node's own public key (SPKI DER, base64url), with which it proves it is the node in its links */
     readonly publicKey: string;
     readonly expires: number;
@@ -76,8 +81,8 @@ export const verifyNodeCertificate = (certificate: unknown, authorityPublicKey: 
 export const renewNodeCertificate = (certificate: unknown, authority: KeyPair, expires: number, now: number): string | undefined => {
     const checked = verifyNodeCertificate(certificate, authority.publicKey, now);
     if (!checked.ok) return undefined;
-    const { nodeId, role, region, publicKey } = checked.claims;
-    return issueNodeCertificate({ nodeId, role, region, publicKey, expires }, authority.privateKey);
+    const { nodeId, role, region, publicKey, group } = checked.claims;
+    return issueNodeCertificate({ nodeId, role, region, publicKey, expires, ...(group === undefined ? {} : { group }) }, authority.privateKey);
 };
 
 /** A fresh challenge for the other end of a link to sign */

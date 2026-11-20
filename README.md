@@ -76,6 +76,9 @@ serves its namespaces down, and relays cache what is subscribed through them and
   directory (`requireListed`).
 - Everything on a link after its handshake is sealed with a key the two ends agree in it, with or without TLS
   underneath (`docs/design/statenet-network.md`).
+- A node links up to a relay (`startOwnerMesh` with `relays`), and a link carries asks both ways, so the relay
+  reaches the nodes below it. Nodes are in groups (`group`, in their certificates): those of one group link to each
+  other directly, and what is for a node of another group goes through the relays, which find it by the directory.
 - An aggregate is the only writer of state: `startAggregateNode` (or `createAggregate` in the node's own process) saves
   what nodes send it, and `createAggregateStorage` is the storage a node uses to save through one. With no database,
   `createFileEpochStorage` keeps the namespaces in files.

@@ -4,9 +4,10 @@ import type { Access, Authority, AuthorityConnection, AuthoritySession, ClaimPol
 import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
 import { startMeshServer } from './MeshServer.js';
 import type { MeshServer } from './MeshServer.js';
-import { createMeshUpstream } from './MeshUpstream.js';
+import { createMeshUpstream, reachThrough } from './MeshUpstream.js';
 import type { MeshUpstream } from './MeshUpstream.js';
 import type { DirectoryView } from './protocol.js';
+import type { RouteTarget } from './serving.js';
 
 export interface PeerLinksOptions {
     readonly nodeId: string;
@@ -15,6 +16,10 @@ export interface PeerLinksOptions {
     /** This node's certificate, or what gives its newest one */
     readonly certificate: string | (() => string);
     readonly authorityPublicKey: string;
+    /** This node's group: a peer of the same group is linked directly, one of another is reached with `through` */
+    readonly group?: string;
+    /** The way to a node of another group: through this node's relay */
+    readonly through?: (nodeId: string) => RouteTarget | undefined;
     /** The directory as it is now: a peer is linked at the endpoint it names, and only while it names one */
     readonly directory: () => DirectoryView;
     /** How long a write sent to a peer may go unanswered before it is rejected; 15 seconds by default */
@@ -23,8 +28,11 @@ export interface PeerLinksOptions {
 }
 
 export interface PeerLinks {
-    /** The link to another owner node, made on first use; undefined when the directory does not name it (it is gone) */
-    link(nodeId: string): MeshUpstream | undefined;
+    /**
+     * The way to another owner node: a link to it, made on first use, when it is of this node's group, and this node's
+     * relay otherwise; undefined when the directory does not name it (it is gone), or there is no way
+     */
+    link(nodeId: string): RouteTarget | undefined;
     /** The node as an `OwnerNode` reaches it: writes, claims and handoffs over its link */
     peer(nodeId: string): NodePeer | undefined;
     /** The nodes linked now */
@@ -53,9 +61,12 @@ export function createPeerLinks(options: PeerLinksOptions): PeerLinks {
             });
         });
 
-    const link = (nodeId: string): MeshUpstream | undefined => {
+    const link = (nodeId: string): RouteTarget | undefined => {
         if (nodeId === options.nodeId) return undefined;
-        const endpoint = options.directory().nodes.find((node) => node.id === nodeId && node.role === 'owner')?.endpoint;
+        const listed = options.directory().nodes.find((node) => node.id === nodeId && node.role === 'owner');
+        // nodes link to each other only inside a group: another group's node is reached through the relays
+        if (listed !== undefined && (listed.group ?? '') !== (options.group ?? '')) return options.through?.(nodeId);
+        const endpoint = listed?.endpoint;
         const found = links.get(nodeId);
         if (found !== undefined && found.endpoint === endpoint) return found.upstream;
         found?.upstream.close();
@@ -64,6 +75,7 @@ export function createPeerLinks(options: PeerLinksOptions): PeerLinks {
         const upstream = createMeshUpstream({
             nodeId: options.nodeId,
             role: 'owner',
+            ...(options.group === undefined ? {} : { group: options.group }),
             ...(options.region === undefined ? {} : { region: options.region }),
             keys: options.keys,
             certificate: options.certificate,
@@ -195,6 +207,13 @@ export interface OwnerMeshOptions {
     /** Answers a node's ask for its next certificate (`MeshServerOptions.certify`) */
     readonly certify?: (certificate: string, claims: NodeCertificateClaims, via: NodeCertificateClaims) => Promise<string | undefined>;
     readonly authorityPublicKey: string;
+    /** This node's group (its certificate names it too): the nodes it links to directly */
+    readonly group?: string;
+    /**
+     * The relays this node links up to, in order of preference (docs/design/statenet-network.md, S9): its way to the
+     * nodes of other groups and, for a node that saves through one, to the aggregate. None by default
+     */
+    readonly relays?: readonly string[];
     /** Where ownership is kept (`PgOwnershipStore`) */
     readonly ownership: OwnershipStore;
     /** The node's authorities: an app server's own (with its logic and storage) */
@@ -222,6 +241,8 @@ export interface OwnerMesh {
     /** This node's relay, over the upstream that follows each namespace's owner */
     readonly relay: Relay;
     readonly mesh: MeshServer;
+    /** This node's link to its relay, when it has relays */
+    readonly uplink: MeshUpstream | undefined;
     /** The URL peers and relays link to, as the server listens (advertise the public one in the directory) */
     readonly url: string;
     /**
@@ -240,8 +261,11 @@ export interface OwnerMesh {
  * claims, a relay that follows each namespace's owner, and a mesh server that peers and relays link to
  */
 export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMesh> {
+    let uplink: MeshUpstream | undefined;
     const peers = createPeerLinks({
         nodeId: options.nodeId,
+        ...(options.group === undefined ? {} : { group: options.group }),
+        through: (nodeId) => (uplink === undefined ? undefined : reachThrough(uplink, nodeId)),
         ...(options.region === undefined ? {} : { region: options.region }),
         keys: options.keys,
         certificate: options.certificate,
@@ -266,9 +290,37 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
     const placed = createPlacedUpstream({ place: (address) => node.place(address), local, remote: (id) => peers.link(id) });
     const isNode = (subject: string): boolean => options.directory().nodes.some((each) => each.id === subject);
     const relay = createRelay(placed, { node: options.nodeId, trustedNodes: isNode, ...(options.grants === undefined ? {} : { grants: options.grants }) });
+    const sessions = async (address: string): Promise<Pick<Authority, 'connect'> | string> => {
+        const authority = node.owns(address) ? await node.authorityOf(address) : undefined;
+        return authority ?? `${address} is not owned by ${options.nodeId}`;
+    };
+    // the relay is served what the peers are: it passes on what the nodes of other groups ask
+    uplink =
+        options.relays === undefined || options.relays.length === 0
+            ? undefined
+            : createMeshUpstream({
+                  nodeId: options.nodeId,
+                  role: 'owner',
+                  ...(options.group === undefined ? {} : { group: options.group }),
+                  ...(options.region === undefined ? {} : { region: options.region }),
+                  keys: options.keys,
+                  certificate: options.certificate,
+                  authorityPublicKey: options.authorityPublicKey,
+                  parents: options.relays,
+                  followDirectory: false,
+                  serve: {
+                      upstream: relay,
+                      write: (address, change, _access, via) => node.write(address, change, via),
+                      sessions,
+                      handoff: (address, to) => node.handoff(address, to),
+                      take: (address) => node.claim(address)
+                  },
+                  ...(options.report === undefined ? {} : { report: options.report })
+              });
     const mesh = await startMeshServer({
         nodeId: options.nodeId,
         role: 'owner',
+        ...(options.group === undefined ? {} : { group: options.group }),
         keys: options.keys,
         certificate: options.certificate,
         authorityPublicKey: options.authorityPublicKey,
@@ -294,6 +346,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
         peers,
         relay,
         mesh,
+        uplink,
         url: mesh.url,
         connect: async (address, connection, access, here) => {
             const placement = await node.place(address);
@@ -307,6 +360,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
             relay.close();
             await node.stop();
             peers.close();
+            uplink?.close();
             await mesh.close();
         }
     };

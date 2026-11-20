@@ -11,7 +11,7 @@ export const MESH_PROTOCOL = 2;
  * sign grants
  */
 export interface DirectoryView {
-    readonly nodes: ReadonlyArray<{ readonly id: string; readonly role: NodeRole; readonly region: string; readonly endpoint: string; /** The node's key as it registered it; a server that asks for listed nodes checks a certificate's key against it */ readonly publicKey?: string }>;
+    readonly nodes: ReadonlyArray<{ readonly id: string; readonly role: NodeRole; readonly region: string; readonly endpoint: string; /** A node's group, and the relay it is linked to: how a relay finds the way to a node of another group */ readonly group?: string; readonly parent?: string; /** The node's key as it registered it; a server that asks for listed nodes checks a certificate's key against it */ readonly publicKey?: string }>;
     readonly owners: Readonly<Record<string, { readonly node: string; readonly epoch: number }>>;
     readonly keys: Readonly<Record<string, GrantKey>>;
 }
@@ -32,9 +32,15 @@ export type LinkWelcome = { type: 'link-welcome'; nodeId: string; certificate: s
 export type LinkProof = { type: 'link-proof'; proof: string };
 export type LinkRefused = { type: 'link-refused'; reason: string };
 
-/** The messages a frame carries, each naming its subscription (`sid`) or write (`wid`) on the link */
+/**
+ * The messages a frame carries, each naming its subscription (`sid`) or write (`wid`) on the link. An ask may name
+ * the node it is for (`to`): a relay passes it on to that node, below it or below another relay
+ * (docs/design/statenet-network.md, "Groups"), and names the node it came from (`from`) where the owner needs it
+ */
 export type MeshMessage =
-    | { type: 'subscribe'; sid: number; address: string; prefix: string; revision?: number; access?: Access }
+    /** What the end that did not open the link asks of the other, and the answers to it: the same messages, the other way */
+    | { type: 'rev'; message: MeshMessage }
+    | { type: 'subscribe'; sid: number; address: string; prefix: string; revision?: number; access?: Access; to?: string }
     | { type: 'renew'; sid: number }
     | { type: 'unsubscribe'; sid: number }
     | { type: 'welcome'; sid: number; welcome: RelayWelcome }
@@ -44,7 +50,7 @@ export type MeshMessage =
     /** The parent dropped what it held back for a slow subscription: subscribe again from your revision */
     | { type: 'resync'; sid: number }
     | { type: 'revoked'; grantId: string; expires: number }
-    | { type: 'write'; wid: number; address: string; change: Change; access?: Access }
+    | { type: 'write'; wid: number; address: string; change: Change; access?: Access; to?: string; from?: string }
     | { type: 'written'; wid: number; outcome: WriteOutcome }
     | { type: 'credit'; amount: number }
     | { type: 'directory'; directory: DirectoryView }
@@ -63,16 +69,16 @@ export type MeshMessage =
      * A session of a namespace the node at the other end owns, tunnelled for a view this node serves: `open` starts it,
      * `say` carries each sync message either way as its text, `shut` ends it from either end
      */
-    | { type: 'open'; tid: number; address: string; access?: Access }
+    | { type: 'open'; tid: number; address: string; access?: Access; to?: string }
     | { type: 'say'; tid: number; text: string }
     | { type: 'shut'; tid: number; reason: string }
     /** A claim (docs/design/statenet-relays.md, "Ownership moves by a claim"): the owner answers with its handoff, or none */
-    | { type: 'claim'; cid: number; address: string }
+    | { type: 'claim'; cid: number; address: string; to?: string; from?: string }
     | { type: 'handoff'; cid: number; handoff?: { revision: number; epoch: number; queued: Array<{ qid: number; change: Change }> } }
     /** The claimant's outcome of a write that was queued in the handoff, for the node that is waiting on it */
     | { type: 'handed'; cid: number; qid: number; outcome: WriteOutcome }
     /** The owner asks the node at the other end to claim a namespace (it sends most of the writes), and hears whether it did */
-    | { type: 'take'; cid: number; address: string }
+    | { type: 'take'; cid: number; address: string; to?: string }
     | { type: 'taken'; cid: number; ok: boolean };
 
 /** Many messages from one moment, of many namespaces, in one WebSocket message */

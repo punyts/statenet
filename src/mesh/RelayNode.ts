@@ -5,9 +5,10 @@ import { startClientServer } from './ClientServer.js';
 import type { ClientServer, ClientServerOptions } from './ClientServer.js';
 import { startMeshServer } from './MeshServer.js';
 import type { MeshServer } from './MeshServer.js';
-import { createMeshUpstream } from './MeshUpstream.js';
+import { createMeshUpstream, reachThrough } from './MeshUpstream.js';
 import type { MeshUpstream, MeshUpstreamOptions } from './MeshUpstream.js';
 import type { DirectoryView } from './protocol.js';
+import type { RouteTarget } from './serving.js';
 
 export interface RelayNodeOptions {
     readonly nodeId: string;
@@ -47,7 +48,11 @@ const EMPTY: DirectoryView = { nodes: [], owners: {}, keys: {} };
  * A relay process (docs/design/statenet-relays.md, "Topology, in steps", 2 and 4): its relay caches what the nodes and
  * browsers below it subscribe to, over its link up the mesh, and serves them: relays below over the mesh protocol,
  * browsers over the sync protocol. It reaches no database: the owners, the nodes and the keys that sign grants come
- * from its parent's directory, and it checks reads with those keys at its edge
+ * from its parent's directory, and it checks reads with those keys at its edge.
+ *
+ * Nodes link to it too (docs/design/statenet-network.md, "Groups"): an ask that names a node goes down that node's
+ * link when it is linked here, and otherwise to the relay the directory says the node is under, over a link this relay
+ * opens to it. What a node sends to be saved goes up, toward an aggregate
  */
 export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNode> {
     let directory: DirectoryView = EMPTY;
@@ -68,6 +73,32 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
             options.upstream?.onDirectory?.(view);
         }
     });
+    /** The links to the relays of other groups, opened when an ask first needs one */
+    const relays = new Map<string, { endpoint: string; link: MeshUpstream }>();
+    const route = (to: string, via: { readonly role: string }): RouteTarget | undefined => {
+        const below = mesh?.peer(to);
+        if (below !== undefined || via.role === 'relay') return below;
+        const under = directory.nodes.find((node) => node.id === to)?.parent;
+        if (under === undefined || under === options.nodeId) return undefined;
+        const endpoint = directory.nodes.find((node) => node.id === under && node.role === 'relay')?.endpoint;
+        const found = relays.get(under);
+        if (found !== undefined && found.endpoint === endpoint) return reachThrough(found.link, to);
+        found?.link.close();
+        relays.delete(under);
+        if (endpoint === undefined || endpoint === '') return undefined;
+        const link = createMeshUpstream({
+            nodeId: options.nodeId,
+            role: 'relay',
+            ...(options.region === undefined ? {} : { region: options.region }),
+            keys: options.keys,
+            certificate: () => upstream.certificate(),
+            authorityPublicKey: options.authorityPublicKey,
+            parents: [endpoint],
+            followDirectory: false
+        });
+        relays.set(under, { endpoint, link });
+        return reachThrough(link, to);
+    };
     const relay = createRelay(upstream, {
         node: options.nodeId,
         trustedNodes: (subject) => directory.nodes.some((node) => node.id === subject),
@@ -87,6 +118,7 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         load: (address, node) => upstream.load(address, node),
         upstream: relay,
         write: (address, change, access) => upstream.write(address, change, access),
+        route,
         directory: () => directory,
         ...(options.host === undefined ? {} : { host: options.host }),
         port: options.meshPort ?? 0
@@ -105,6 +137,8 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         mesh: server,
         close: async () => {
             relay.close();
+            for (const { link } of relays.values()) link.close();
+            relays.clear();
             upstream.close();
             await server.close();
             await clients?.close();
