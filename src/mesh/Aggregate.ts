@@ -1,9 +1,13 @@
+import { report } from '@punyts/core';
 import { FencedError } from '@punyts/state-sync/authority';
 import type { EpochStorage, StoredNamespace, Upstream } from '@punyts/state-sync/authority';
 import type { KeyPair, NodeRole } from './certificates.js';
 import { startMeshServer } from './MeshServer.js';
 import type { MeshServer, MeshServerOptions } from './MeshServer.js';
 import type { DirectoryView, LoadOutcome, PersistOutcome, RemoveOutcome } from './protocol.js';
+
+/** The category of an aggregate's reports: addresses, epochs, revisions, counts and durations, never values */
+const CATEGORY = 'statenet.aggregate';
 
 /** An aggregate's storage: namespaces under epochs, and, where it can, removing one whole */
 export type AggregateStorageBackend = EpochStorage & { remove?(address: string, epoch?: number): Promise<void> };
@@ -25,7 +29,6 @@ export interface AggregateOptions {
      * address. Without it the storage's fence is the only check
      */
     readonly mayPersist?: (address: string, node: string | undefined, epoch: number) => Promise<boolean> | boolean;
-    readonly report?: (message: string) => void;
 }
 
 /** What an aggregate says about its work, for its owner and tests */
@@ -87,21 +90,25 @@ export function createAggregate(storage: AggregateStorageBackend, options: Aggre
                 if (landed !== undefined && batch.epoch === landed.epoch && batch.stored.revision <= landed.revision) {
                     // sent again while the first was being saved (its link dropped): it has landed by now
                     folded += batch.waiters.length;
+                    report(CATEGORY, 'Folded %s saves of %s: revision %s has landed', [batch.waiters.length, address, landed.revision]);
                     for (const waiter of batch.waiters) waiter.done({ result: 'saved', revision: landed.revision });
                     continue;
                 }
+                const start = performance.now();
                 try {
                     await storage.save(address, batch.stored, batch.epoch);
                     saves++;
+                    report(CATEGORY, 'Saved %s at revision %s under epoch %s in %s ms, for %s waiting', [address, batch.stored.revision, batch.epoch, Math.round((performance.now() - start) * 10) / 10, batch.waiters.length]);
                     lane.head = { revision: batch.stored.revision, epoch: batch.epoch };
                     outcome = { result: 'saved', revision: batch.stored.revision };
                 } catch (error) {
                     if (error instanceof FencedError) {
                         lane.head = { revision: lane.head?.revision ?? 0, epoch: Math.max(error.current, lane.head?.epoch ?? 0) };
+                        report(CATEGORY, 'Fenced a save of %s under epoch %s: the storage has epoch %s', [address, batch.epoch, error.current]);
                         outcome = fence(batch.epoch, error.current);
                     } else {
                         const reason = error instanceof Error ? error.message : String(error);
-                        options.report?.(`Saving ${address} failed: ${reason}`);
+                        report.error('Saving %s at revision %s failed: %s', [address, batch.stored.revision, error instanceof Error ? error.name : typeof error]);
                         outcome = { result: 'failed', reason };
                     }
                 }
@@ -115,11 +122,17 @@ export function createAggregate(storage: AggregateStorageBackend, options: Aggre
 
     return {
         persist: async (address, stored, epoch, node) => {
-            if (options.mayPersist !== undefined && !(await options.mayPersist(address, node, epoch))) return { result: 'failed', reason: `${node ?? 'this node'} does not order ${address}` };
+            if (options.mayPersist !== undefined && !(await options.mayPersist(address, node, epoch))) {
+                report.warning('Refused a save of %s from %s: it does not order it', [address, node ?? 'a node']);
+                return { result: 'failed', reason: `${node ?? 'this node'} does not order ${address}` };
+            }
             let lane = lanes.get(address);
             if (lane === undefined) lanes.set(address, (lane = { running: false }));
             const head = lane.head;
-            if (head !== undefined && epoch < head.epoch) return fence(epoch, head.epoch);
+            if (head !== undefined && epoch < head.epoch) {
+                report(CATEGORY, 'Fenced a save of %s under epoch %s: it has epoch %s', [address, epoch, head.epoch]);
+                return fence(epoch, head.epoch);
+            }
             if (head !== undefined && epoch === head.epoch && stored.revision <= head.revision) {
                 folded++;
                 return { result: 'saved', revision: head.revision };
@@ -242,7 +255,7 @@ const noSubscriptions: Upstream = {
  * saves and loads what they pass up from their nodes. Only relays can open a link to it (`mayLink`)
  */
 export async function startAggregateNode(options: AggregateNodeOptions): Promise<AggregateNode> {
-    const aggregate = createAggregate(options.storage, { ...(options.mayPersist === undefined ? {} : { mayPersist: options.mayPersist }), ...(options.report === undefined ? {} : { report: options.report }) });
+    const aggregate = createAggregate(options.storage, { ...(options.mayPersist === undefined ? {} : { mayPersist: options.mayPersist }) });
     const mesh = await startMeshServer({
         nodeId: options.nodeId,
         role: 'aggregate',

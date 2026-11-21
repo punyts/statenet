@@ -1,3 +1,4 @@
+import { report } from '@punyts/core';
 import { createRelay } from '@punyts/state-sync/authority';
 import type { Relay } from '@punyts/state-sync/authority';
 import type { KeyPair } from './certificates.js';
@@ -42,6 +43,9 @@ export interface RelayNode {
     close(): Promise<void>;
 }
 
+/** The category of a relay process: node ids and counts, never values */
+const CATEGORY = 'statenet.relay';
+
 const EMPTY: DirectoryView = { nodes: [], owners: {}, keys: {} };
 
 /**
@@ -68,6 +72,7 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         ...(options.onCertificate === undefined ? {} : { onCertificate: options.onCertificate }),
         ...options.upstream,
         onDirectory: (view) => {
+            report(CATEGORY, 'Relay %s learned the directory: %s nodes, %s owners', [options.nodeId, view.nodes.length, Object.keys(view.owners).length]);
             directory = view;
             mesh?.directoryChanged();
             options.upstream?.onDirectory?.(view);
@@ -85,7 +90,11 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         if (found !== undefined && found.endpoint === endpoint) return reachThrough(found.link, to);
         found?.link.close();
         relays.delete(under);
-        if (endpoint === undefined || endpoint === '') return undefined;
+        if (endpoint === undefined || endpoint === '') {
+            report(CATEGORY, 'Relay %s has no way to %s: its relay %s has no endpoint', [options.nodeId, to, under]);
+            return undefined;
+        }
+        report(CATEGORY, 'Relay %s opens a link to the relay %s, for %s', [options.nodeId, under, to]);
         const link = createMeshUpstream({
             nodeId: options.nodeId,
             role: 'relay',
@@ -129,6 +138,7 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
             ? undefined
             : await startClientServer({ upstream: relay, write: (address, change, access) => upstream.write(address, change, access), ...(options.accessOf === undefined ? {} : { accessOf: options.accessOf }), ...(options.host === undefined ? {} : { host: options.host }), port: options.clientPort });
     const server = mesh;
+    report(CATEGORY, 'Relay %s started: links at %s, browsers at %s', [options.nodeId, server.url, clients?.url ?? '(none)']);
     return {
         nodeId: options.nodeId,
         meshUrl: server.url,
@@ -137,6 +147,7 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         upstream,
         mesh: server,
         close: async () => {
+            report(CATEGORY, 'Relay %s stops', [options.nodeId]);
             relay.close();
             for (const { link } of relays.values()) link.close();
             relays.clear();

@@ -21,6 +21,27 @@ npx statenet --data-dir ./data
 
 Clients connect to `ws://<host>:<port>/sync`. `GET /health` answers `{ "ok": true }`. `npm start` runs `node dist/cli.js`.
 
+### Reporting
+Both bins write reports to stderr, one line each, `[statenet] <category> <message>` (`[statenet-relay]` for the
+relay). They turn on `statenet.*`, `state-sync.*`, `info`, `warning` and `error`, and the categories
+`PUNYTS_REPORT` lists: comma-separated, trimmed, empty entries ignored, a family as `<library>.*`
+(`PUNYTS_REPORT=state.set,stateui-app.*`). Reports name namespaces, addresses, node ids, paths, revisions, counts and
+durations, never a value.
+
+| Category | Reports |
+|---|---|
+| `statenet.service` | namespace loads with ms, clients joining and leaving, refused connections and upgrades, emits relayed |
+| `statenet.mesh` | mesh servers listening, links opened and closed, links up, reconnects with their delay, nodes dropped from the directory |
+| `statenet.mesh.serving` | subscriptions served, slow nodes told to catch up, sessions, handoffs, saves and writes passed on with their outcome |
+| `statenet.owner` | an owner node's start and stop, peer links, following a namespace's owner, sessions placed |
+| `statenet.relay` | a relay's start and stop, the directory it learned, links to other groups' relays |
+| `statenet.relay.client` | browsers' subscriptions and the outcome of their changes |
+| `statenet.aggregate` | saves with ms, folded saves, fenced epochs |
+| `statenet.certificate` | certificate renewals asked, given and passed on |
+
+Refused links and saves and unanswered writes are warnings, a failed save an error; listening and stopping are info.
+`state-sync.*` is listed in state-sync's README.
+
 ## Use it from code
 
 ```ts

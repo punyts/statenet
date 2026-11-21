@@ -1,3 +1,4 @@
+import { report } from '@punyts/core';
 import { createServer as createHttpServer } from 'node:http';
 import type { Server as HttpServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
@@ -17,6 +18,9 @@ import { createServing } from './serving.js';
 import type { MeshWriter, Serving, ServingOptions, SessionEndpoint } from './serving.js';
 
 export type { MeshWriter, SessionEndpoint } from './serving.js';
+
+/** The category of a mesh server's reports: node ids, roles and counts, never values */
+const CATEGORY = 'statenet.mesh';
 
 export interface MeshServerOptions {
     readonly nodeId: string;
@@ -156,6 +160,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
         let facts: Parameters<typeof transcript>[2] | undefined;
         let link: Link | undefined;
         const refuse = (reason: string): void => {
+            report.warning('Node %s refused a link from %s: %s', [options.nodeId, peer?.nodeId ?? 'a node', reason]);
             send(socket, { type: 'link-refused', reason });
             socket.close(4401, reason.slice(0, 100));
         };
@@ -228,6 +233,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                 };
                 link = opened;
                 links.add(link);
+                report(CATEGORY, 'Node %s opened a link from %s (%s): %s links', [options.nodeId, opened.peer.nodeId, opened.peer.role, links.size]);
                 opened.scheduled = true;
                 queueMicrotask(() => flush(opened));
                 return;
@@ -238,6 +244,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
             clearTimeout(timeout);
             if (link === undefined) return;
             links.delete(link);
+            report(CATEGORY, 'The link from %s to node %s closed: %s links', [link.peer.nodeId, options.nodeId, links.size]);
             link.serving.close();
             link.client.close();
         });
@@ -247,6 +254,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
     await new Promise<void>((resolve) => http.listen(options.port ?? 0, options.host ?? '127.0.0.1', resolve));
     const address = http.address() as AddressInfo;
     const host = address.family === 'IPv6' ? `[${address.address}]` : address.address;
+    report(CATEGORY, 'Node %s (%s) takes links at %s', [options.nodeId, options.role, `${options.tls === undefined ? 'ws' : 'wss'}://${host}:${address.port}`]);
     return {
         url: `${options.tls === undefined ? 'ws' : 'wss'}://${host}:${address.port}`,
         stats: () => ({
@@ -257,7 +265,10 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
             const directory = options.directory();
             for (const link of [...links]) {
                 if (listed(link.peer)) queue(link, { type: 'directory', directory });
-                else link.socket.close(4403, 'the node is no longer in the directory');
+                else {
+                    report(CATEGORY, 'Node %s closes the link from %s: it is no longer in the directory', [options.nodeId, link.peer.nodeId]);
+                    link.socket.close(4403, 'the node is no longer in the directory');
+                }
             }
         },
         close: async () => {

@@ -1,3 +1,4 @@
+import { isReported, report } from '@punyts/core';
 import { createServer } from 'node:http';
 import type { IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -6,6 +7,9 @@ import type { SyncMessage } from '@punyts/state-sync';
 import type { Access, RelaySubscription, Upstream } from '@punyts/state-sync/authority';
 import { WebSocketServer } from 'ws';
 import type { MeshWriter } from './MeshServer.js';
+
+/** The category of a relay's browser side: addresses, revisions, paths and outcomes, never values */
+const CATEGORY = 'statenet.relay.client';
 
 /** A namespace name of the sync protocol for an address: `<owner>.<app>.<scope>` for `<owner>/<app>/<scope>` */
 export const namespaceOfAddress = (address: string): string => address.split('/').join('.');
@@ -60,6 +64,7 @@ export async function startClientServer(options: ClientServerOptions): Promise<C
         socket.on('message', (data) => {
             const parsed = parseMessage(data.toString());
             if (!parsed.ok) {
+                report(CATEGORY, 'Refused a message from a browser: %s', [parsed.error.code]);
                 send({ type: 'error', code: parsed.error.code, message: parsed.error.message });
                 return;
             }
@@ -68,10 +73,12 @@ export async function startClientServer(options: ClientServerOptions): Promise<C
                 stop();
                 address = addressOfNamespace(message.namespace);
                 if (address === undefined) {
+                    report(CATEGORY, 'Refused a hello for %s: not <owner>.<app>.<scope>', [message.namespace]);
                     send({ type: 'error', code: 'wrong-namespace', message: 'a namespace here is <owner>.<app>.<scope>' });
                     return;
                 }
                 const namespace = message.namespace;
+                report(CATEGORY, 'A browser subscribes to %s from revision %s', [address, message.revision]);
                 subscription = options.upstream.subscribe(
                     address,
                     '$',
@@ -86,6 +93,7 @@ export async function startClientServer(options: ClientServerOptions): Promise<C
                         changes: (batch) => send({ type: 'changes', changes: [...batch.changes] }),
                         durable: (revision) => send({ type: 'durable', revision }),
                         closed: (reason) => {
+                            report(CATEGORY, 'The subscription of a browser to %s closed: %s', [namespace, reason]);
                             send({ type: 'error', code: reason === 'revoked' ? 'revoked' : 'closed', message: reason });
                             socket.close();
                         }
@@ -98,15 +106,17 @@ export async function startClientServer(options: ClientServerOptions): Promise<C
             }
             if (message.type === 'change' && address !== undefined) {
                 const change = message.change;
-                void options.write(address, change, access).then((outcome) =>
+                const written = address;
+                void options.write(address, change, access).then((outcome) => {
+                    if (isReported(CATEGORY)) report(CATEGORY, 'A browser\'s change of %s at %s: %s', [written, change.path, outcome.result]);
                     send(
                         outcome.result === 'rejected'
                             ? { type: 'ack', id: change.id, result: 'rejected', reason: outcome.reason }
                             : outcome.result === 'adjusted'
                               ? { type: 'ack', id: change.id, result: 'adjusted', revision: outcome.revision, value: outcome.value ?? null }
                               : { type: 'ack', id: change.id, result: 'applied', revision: outcome.revision }
-                    )
-                );
+                    );
+                });
             }
         });
         socket.on('close', stop);

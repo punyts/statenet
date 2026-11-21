@@ -3,7 +3,9 @@ import { createStoreBridge, createSyncClient } from '@punyts/state-sync';
 import type { Change, JsonValue, SyncTransport } from '@punyts/state-sync';
 import { createAuthority, createMemoryEpochStorage, createMemoryOwnershipStore } from '@punyts/state-sync/authority';
 import type { Authority, AuthoritySession, EpochStorage, NamespaceHost, OwnershipStore, RelayListener } from '@punyts/state-sync/authority';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { addListener, removeListener, setCategories } from '@punyts/core';
+import type { ListenerFn } from '@punyts/core';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAggregateStorage, startAggregateNode } from './Aggregate.js';
 import { generateKeyPair, issueNodeCertificate } from './certificates.js';
 import type { NodeRole } from './certificates.js';
@@ -146,21 +148,38 @@ const TWO_GROUPS: readonly Placed[] = [
     { id: 'b1', group: 'b', relay: 'relay-b' }
 ];
 
+/** The warnings and statenet reports heard during a test, from @punyts/core's reporter */
+const heard: string[] = [];
+const hear: ListenerFn = (_timestamp, _category, message) => {
+    heard.push(message);
+};
+const HEARD = ['warning', 'statenet.*'];
+beforeEach(() => {
+    heard.length = 0;
+    setCategories(['error', ...HEARD]);
+    addListener(hear, HEARD);
+});
+afterEach(() => {
+    removeListener(hear, HEARD);
+    setCategories(['info', 'error', 'stack']);
+});
+/** What was heard of a node: the reports that name it */
+const heardOf = (nodeId: string): string[] => heard.filter((line) => line.includes(nodeId));
+
 describe('nodes in groups', () => {
     it('should refuse a node of another group that links to a node directly, at either end', async () => {
         // Arrange
         const { nodes } = await statenet(TWO_GROUPS);
-        const said: string[] = [];
         const keys = generateKeyPair();
 
         // Act: a node of group a dials b1
-        const honest = createMeshUpstream({ nodeId: 'a2', role: 'owner', group: 'a', keys, certificate: certificate('a2', 'owner', keys.publicKey, 'a'), authorityPublicKey: ca.publicKey, parents: [nodes('b1').url], followDirectory: false, backoff: () => 5_000, report: (line) => said.push(line) });
+        const honest = createMeshUpstream({ nodeId: 'a2', role: 'owner', group: 'a', keys, certificate: certificate('a2', 'owner', keys.publicKey, 'a'), authorityPublicKey: ca.publicKey, parents: [nodes('b1').url], followDirectory: false, backoff: () => 5_000 });
         closers.push(() => honest.close());
-        await vi.waitFor(() => expect(said.length).toBeGreaterThan(0));
+        await vi.waitFor(() => expect(heardOf('a2').join(' ')).toContain('does not link'));
 
         // Assert
         expect(honest.linked()).toBe(false);
-        expect(said.join('\n')).toContain('a node of group a does not link to a node of group b');
+        expect(heardOf('a2').join('\n')).toContain('a node of group a does not link to a node of group b');
         expect(nodes('b1').mesh.stats().links).toEqual([]);
     });
 

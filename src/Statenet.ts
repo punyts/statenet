@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
-import { report } from "@punyts/core";
+import { isReported, report } from "@punyts/core";
 import { parseMessage } from "@punyts/state-sync";
 import type { ErrorMessage } from "@punyts/state-sync";
 import { createAuthority } from "@punyts/state-sync/authority";
@@ -20,6 +20,12 @@ export const DEFAULT_LOG_LENGTH = 1000;
 const MAX_PENDING = 100;
 const KEEP_ALIVE_MS = 30_000;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+/** The category of the service's reports: namespaces, client ids and counts, never values */
+const CATEGORY = "statenet.service";
+
+/** Milliseconds since a start, rounded to a tenth */
+const elapsed = (start: number): number => Math.round((performance.now() - start) * 10) / 10;
+
 /** The emit the statenet sends a namespace when one of its clients leaves: `{ clientId }` */
 export const LEFT_EMIT = "statenet.left";
 
@@ -82,8 +88,9 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
     const authorityOf = (namespace: string): Promise<Authority> => {
         let authority = authorities.get(namespace);
         if (authority === undefined) {
+            const start = performance.now();
             authority = createAuthority({ namespace, storage, logLength, createParents: true }).then((created) => {
-                report("statenet", "Loaded namespace %s at revision %s", [namespace, created.revision()]);
+                report(CATEGORY, "Loaded namespace %s at revision %s in %s ms", [namespace, created.revision(), elapsed(start)]);
                 return created;
             });
             authority.catch(() => authorities.delete(namespace));
@@ -104,6 +111,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         if (!parsed.ok || parsed.message.type !== "emit") return;
         const { name, value } = parsed.message;
         const relayed = JSON.stringify(value === undefined ? { type: "emit", name } : { type: "emit", name, value });
+        if (isReported(CATEGORY)) report(CATEGORY, "Relaying the emit %s of %s from %s", [name, namespace, from.server ? "an app server" : "a page"]);
         for (const member of members.get(namespace) ?? []) {
             if (member === from || (!from.server && !member.server)) continue;
             member.send(relayed);
@@ -113,6 +121,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
     const leave = (namespace: string, member: Member): void => {
         const joined = members.get(namespace);
         if (joined === undefined || !joined.delete(member)) return;
+        report(CATEGORY, "Client %s left %s: %s clients", [member.clientId, namespace, joined.size]);
         if (joined.size === 0) {
             members.delete(namespace);
             return;
@@ -133,6 +142,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         const pending: string[] = [];
         const timer = setInterval(() => ws.ping(), KEEP_ALIVE_MS);
         const refuse = (code: string, message: string, closeCode: number): void => {
+            report(CATEGORY, "Refused a connection: %s", [code]);
             if (ws.readyState === ws.OPEN) ws.send(errorMessage(code, message));
             ws.close(closeCode, code);
         };
@@ -164,7 +174,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
                         },
                         close: () => ws.close()
                     });
-                    report("statenet", "A client joined %s", [namespace]);
+                    report(CATEGORY, "Client %s joined %s from %s", [clientId, namespace, server ? "an app server" : "a page"]);
                     session.receive(text);
                     const joining: Member = {
                         clientId,
@@ -184,7 +194,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
                     }
                 })
                 .catch((error: unknown) => {
-                    report("statenet", "Could not load namespace %s: %s", [namespace, error instanceof Error ? error.message : String(error)]);
+                    report(CATEGORY, "Could not load namespace %s: %s", [namespace, error instanceof Error ? error.name : typeof error]);
                     refuse("unavailable", "The namespace could not be loaded", 1011);
                 });
         });
@@ -223,8 +233,14 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
     const server: Server = createServer(onRequest);
     server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
         const path = (request.url ?? "/").split("?")[0];
-        if (path !== SYNC_PATH) return refuseUpgrade(socket, 404, "Not Found");
-        if (!isAllowed(request)) return refuseUpgrade(socket, 403, "Forbidden");
+        if (path !== SYNC_PATH) {
+            report(CATEGORY, "Refused an upgrade at %s: not the sync path", [path]);
+            return refuseUpgrade(socket, 404, "Not Found");
+        }
+        if (!isAllowed(request)) {
+            report(CATEGORY, "Refused an upgrade: its host or origin is not allowed");
+            return refuseUpgrade(socket, 403, "Forbidden");
+        }
         sockets.handleUpgrade(request, socket, head, (ws) => onConnection(ws, request));
     });
 
@@ -237,13 +253,14 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
     });
     const address = server.address() as AddressInfo;
     const hostForUrl = address.family === "IPv6" ? `[${address.address}]` : address.address;
-    report("statenet", "Listening on %s", [`ws://${hostForUrl}:${address.port}${SYNC_PATH}`]);
+    report.info("statenet listening on %s", [`ws://${hostForUrl}:${address.port}${SYNC_PATH}`]);
 
     return {
         url: `ws://${hostForUrl}:${address.port}${SYNC_PATH}`,
         port: address.port,
         namespaces: () => [...authorities.keys()],
         close: async () => {
+            const start = performance.now();
             const loaded = await Promise.all([...authorities.values()].map((authority) => authority.catch(() => undefined)));
             for (const authority of loaded) authority?.close();
             members.clear();
@@ -252,6 +269,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
             await Promise.all(loaded.map((authority) => authority?.flush()));
             authorities.clear();
             await new Promise<void>((resolve) => server.close(() => resolve()));
+            report.info("statenet stopped: %s namespaces saved and closed in %s ms", [loaded.length, elapsed(start)]);
         }
     };
 };

@@ -1,8 +1,12 @@
+import { isReported, report } from '@punyts/core';
 import type { Change, RevisedChange } from '@punyts/state-sync';
 import type { Access, Authority, AuthorityConnection, AuthoritySession, Handoff, RelayBatch, RelaySubscription, StoredNamespace, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import { verifyNodeCertificate } from './certificates.js';
 import type { NodeCertificateClaims } from './certificates.js';
 import type { LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
+
+/** The category of a link's serving: node ids, addresses, prefixes and counts, never values */
+const CATEGORY = 'statenet.mesh.serving';
 
 /** Applies a write that came over a link: `via` is the node at the other end */
 export type MeshWriter = (address: string, change: Change, access?: Access, via?: string) => Promise<WriteOutcome>;
@@ -132,6 +136,7 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
         served.held = held === undefined ? batch : { previous: held.previous, revision: batch.revision, changes: fold([...held.changes, ...batch.changes]), ...(batch.epoch === undefined ? {} : { epoch: batch.epoch }) };
         if (served.held.changes.length > maxHeld) {
             // too far behind: let it go, and have the node catch up from its own revision
+            report(CATEGORY, 'Node %s fell more than %s changes behind on a subscription: it catches up again', [peer.nodeId, maxHeld]);
             served.subscription.close();
             subscriptions.delete(sid);
             push({ type: 'resync', sid });
@@ -156,9 +161,11 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                 const access: Access = { subject: peer.nodeId };
                 const target = routed(message.to);
                 if (target === undefined) {
+                    report(CATEGORY, 'Node %s cannot pass a subscription of %s on: %s', [options.nodeId, peer.nodeId, unreachable(message.to)]);
                     push({ type: 'closed', sid, reason: unreachable(message.to) });
                     return;
                 }
+                if (isReported(CATEGORY)) report(CATEGORY, 'Node %s serves %s a subscription to %s %s%s', [options.nodeId, peer.nodeId, message.address, message.prefix, target === null ? '' : ` through ${message.to ?? ''}`]);
                 const subscription = (target ?? options.upstream).subscribe(
                     message.address,
                     message.prefix,
@@ -207,6 +214,7 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                             ? 'this node serves no sessions'
                             : await options.sessions(message.address, message.access, peer.nodeId).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
                 opening.delete(tid);
+                report(CATEGORY, 'Node %s %s a session of %s for %s%s', [options.nodeId, typeof endpoint === 'string' ? 'refused' : 'opened', message.address, peer.nodeId, typeof endpoint === 'string' ? `: ${endpoint}` : '']);
                 if (typeof endpoint === 'string') {
                     if (!pending.shut) push({ type: 'shut', tid, reason: endpoint });
                     return;
@@ -256,6 +264,7 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                     handed.set(`${message.cid}/${qid}`, item.done);
                     return { qid, change: item.change };
                 });
+                report(CATEGORY, 'Node %s passed the handoff of %s to %s at revision %s', [options.nodeId, message.address, peer.nodeId, handoff.revision]);
                 push({ type: 'handoff', cid: message.cid, handoff: { revision: handoff.revision, epoch: handoff.epoch, queued } });
                 return;
             }
@@ -277,6 +286,7 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                 const node = peer.role === 'relay' && typeof message.node === 'string' ? message.node : peer.nodeId;
                 const failed = (reason: string): PersistOutcome => ({ result: 'failed', reason });
                 const outcome = options.persist === undefined ? failed(`${options.nodeId} keeps nothing for other nodes`) : await options.persist(message.address, message.stored, message.epoch, node).catch((error: unknown) => failed(error instanceof Error ? error.message : String(error)));
+                if (isReported(CATEGORY)) report(CATEGORY, 'Node %s saved %s for %s at revision %s: %s', [options.nodeId, message.address, node, message.stored.revision, outcome.result]);
                 push({ type: 'persisted', pid: message.pid, outcome });
                 return;
             }
@@ -299,13 +309,16 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                 // a node asks for itself; only a relay passes on the ask of a node below it
                 const allowed = checked.ok && (checked.claims.nodeId === peer.nodeId || peer.role === 'relay');
                 const next = allowed ? await options.certify?.(message.certificate, checked.claims, peer).catch(() => undefined) : undefined;
+                report('statenet.certificate', 'Node %s %s the next certificate of %s, asked by %s', [options.nodeId, next === undefined ? 'gave no' : 'passed on', checked.ok ? checked.claims.nodeId : 'an unknown node', peer.nodeId]);
                 push({ type: 'certified', rid: message.rid, ...(next === undefined ? {} : { certificate: next }) });
                 return;
             }
             case 'write': {
                 const target = routed(message.to);
                 const rejected = (reason: string): WriteOutcome => ({ result: 'rejected', reason });
+                if (target === undefined) report(CATEGORY, 'Node %s cannot pass a write of %s on: %s', [options.nodeId, message.address, unreachable(message.to)]);
                 const outcome = target === undefined ? rejected(unreachable(message.to)) : await (target !== null ? target.write(message.address, message.change, message.access, origin(message.from)) : options.write(message.address, message.change, message.access, origin(message.from))).catch((error: unknown): WriteOutcome => ({ result: 'rejected', reason: error instanceof Error ? error.message : String(error) }));
+                if (isReported(CATEGORY)) report(CATEGORY, 'Node %s wrote %s at %s for %s: %s', [options.nodeId, message.address, message.change.path, peer.nodeId, outcome.result]);
                 push({ type: 'written', wid: message.wid, outcome });
                 return;
             }

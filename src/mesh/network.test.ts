@@ -1,5 +1,7 @@
 import type { Upstream } from '@punyts/state-sync/authority';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { addListener, removeListener, setCategories } from '@punyts/core';
+import type { ListenerFn } from '@punyts/core';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import { generateKeyPair, issueNodeCertificate, mayLink, proveNode, renewNodeCertificate, verifyNodeCertificate } from './certificates.js';
 import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
@@ -48,7 +50,6 @@ async function server(nodeId: string, role: NodeRole, more: Partial<MeshServerOp
 /** A node's link up, with what it reported */
 function dial(nodeId: string, role: NodeRole, url: string, more: Partial<MeshUpstreamOptions> = {}) {
     const keys = more.keys ?? generateKeyPair();
-    const said: string[] = [];
     const upstream = createMeshUpstream({
         nodeId,
         role,
@@ -58,11 +59,10 @@ function dial(nodeId: string, role: NodeRole, url: string, more: Partial<MeshUps
         parents: [url],
         followDirectory: false,
         backoff: () => 20,
-        report: (message) => said.push(message),
         ...more
     });
     closers.push(() => upstream.close());
-    return { upstream, keys, said };
+    return { upstream, keys, get said() { return heardOf(nodeId); } };
 }
 
 /** A link opened by hand over a bare socket: the handshake, then the seal and the socket to misuse */
@@ -85,6 +85,24 @@ async function handshake(url: string, nodeId: string, role: NodeRole): Promise<{
     seal.open(await first);
     return { socket, seal, closed };
 }
+
+/** The warnings and statenet reports heard during a test, from @punyts/core's reporter */
+const heard: string[] = [];
+const hear: ListenerFn = (_timestamp, _category, message) => {
+    heard.push(message);
+};
+const HEARD = ['warning', 'statenet.*'];
+beforeEach(() => {
+    heard.length = 0;
+    setCategories(['error', ...HEARD]);
+    addListener(hear, HEARD);
+});
+afterEach(() => {
+    removeListener(hear, HEARD);
+    setCategories(['info', 'error', 'stack']);
+});
+/** What was heard of a node: the reports that name it */
+const heardOf = (nodeId: string): string[] => heard.filter((line) => line.includes(nodeId));
 
 describe('who may link to whom', () => {
     it('should let a node dial a node or a relay, a relay dial a node, a relay or an aggregate, and an aggregate dial nothing', () => {
@@ -146,7 +164,7 @@ describe('who may link to whom', () => {
 
         // Act
         const aggregate = dial('aggregate-1', 'aggregate', node.mesh.url);
-        await vi.waitFor(() => expect(aggregate.said.length).toBeGreaterThan(0));
+        await vi.waitFor(() => expect(aggregate.said.join(' ')).toContain('refused'));
 
         // Assert
         expect(aggregate.upstream.linked()).toBe(false);

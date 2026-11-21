@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { Change } from '@punyts/state-sync';
 import { createMemoryEpochStorage, createMemoryOwnershipStore, FencedError, OwnerNode } from '@punyts/state-sync/authority';
 import type { EpochStorage, StoredNamespace } from '@punyts/state-sync/authority';
+import { addListener, clearListeners, setCategories } from '@punyts/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFileEpochStorage } from '../FileEpochStorage.js';
 import { createAggregate, createAggregateStorage, startAggregateNode } from './Aggregate.js';
@@ -333,6 +334,32 @@ describe('a node that saves through an aggregate', () => {
 
         // Assert
         expect(await pending).toEqual({ result: 'failed', reason: 'the link is closed' });
+    });
+
+    it('should report the links, the relay and the save by node, address and revision, and never the values', async () => {
+        // Arrange
+        const heard: Array<{ category: string; message: string }> = [];
+        setCategories(['statenet.*']);
+        addListener((_timestamp, category, message) => heard.push({ category, message }), ['statenet.*']);
+        try {
+            const { link } = await chain(createMemoryEpochStorage());
+
+            // Act
+            const outcome = await link.persist(ADDRESS, stored(1, { card: 'card-4242-secret' }), 1);
+
+            // Assert
+            const messages = (category: string) => heard.filter((entry) => entry.category === category).map((entry) => entry.message);
+            expect(outcome).toEqual({ result: 'saved', revision: 1 });
+            expect(messages('statenet.mesh').some((message) => message.startsWith('Node relay-1 opened a link from node-1 (owner)'))).toBe(true);
+            expect(messages('statenet.mesh').some((message) => message.startsWith('Node node-1 linked to relay-1 at ws://'))).toBe(true);
+            expect(messages('statenet.relay').some((message) => message.startsWith('Relay relay-1 started: links at ws://'))).toBe(true);
+            expect(messages('statenet.mesh.serving')).toContain(`Node aggregate-1 saved ${ADDRESS} for node-1 at revision 1: saved`);
+            expect(messages('statenet.aggregate').some((message) => /^Saved alice\/notes\/user at revision 1 under epoch 1 in [\d.]+ ms, for 1 waiting$/.test(message))).toBe(true);
+            expect(JSON.stringify(heard)).not.toContain('card-4242-secret');
+        } finally {
+            setCategories(['info', 'error', 'stack']);
+            clearListeners();
+        }
     });
 });
 

@@ -1,3 +1,4 @@
+import { report } from '@punyts/core';
 import type { Change } from '@punyts/state-sync';
 import { createAuthorityUpstream, createRelay, OwnerNode } from '@punyts/state-sync/authority';
 import type { Access, Authority, AuthorityConnection, AuthoritySession, ClaimPolicy, GrantKey, NamespaceHost, NodePeer, OwnershipStore, Placement, Relay, RelayListener, RelaySubscription, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
@@ -8,6 +9,9 @@ import { createMeshUpstream, reachThrough } from './MeshUpstream.js';
 import type { MeshUpstream } from './MeshUpstream.js';
 import type { DirectoryView } from './protocol.js';
 import type { RouteTarget } from './serving.js';
+
+/** The category of an owner node's mesh: node ids, addresses and attempts, never values */
+const CATEGORY = 'statenet.owner';
 
 export interface PeerLinksOptions {
     readonly nodeId: string;
@@ -24,7 +28,6 @@ export interface PeerLinksOptions {
     readonly directory: () => DirectoryView;
     /** How long a write sent to a peer may go unanswered before it is rejected; 15 seconds by default */
     readonly writeTimeoutMs?: number;
-    readonly report?: (message: string) => void;
 }
 
 export interface PeerLinks {
@@ -65,13 +68,20 @@ export function createPeerLinks(options: PeerLinksOptions): PeerLinks {
         if (nodeId === options.nodeId) return undefined;
         const listed = options.directory().nodes.find((node) => node.id === nodeId && node.role === 'owner');
         // nodes link to each other only inside a group: another group's node is reached through the relays
-        if (listed !== undefined && (listed.group ?? '') !== (options.group ?? '')) return options.through?.(nodeId);
+        if (listed !== undefined && (listed.group ?? '') !== (options.group ?? '')) {
+            report(CATEGORY, 'Node %s reaches %s of group %s through its relay', [options.nodeId, nodeId, listed.group ?? '(none)']);
+            return options.through?.(nodeId);
+        }
         const endpoint = listed?.endpoint;
         const found = links.get(nodeId);
         if (found !== undefined && found.endpoint === endpoint) return found.upstream;
         found?.upstream.close();
         links.delete(nodeId);
-        if (endpoint === undefined || endpoint === '') return undefined;
+        if (endpoint === undefined || endpoint === '') {
+            report(CATEGORY, 'Node %s has no way to %s: the directory names no endpoint', [options.nodeId, nodeId]);
+            return undefined;
+        }
+        report(CATEGORY, 'Node %s opens a link to its peer %s', [options.nodeId, nodeId]);
         const upstream = createMeshUpstream({
             nodeId: options.nodeId,
             role: 'owner',
@@ -81,8 +91,7 @@ export function createPeerLinks(options: PeerLinksOptions): PeerLinks {
             certificate: options.certificate,
             authorityPublicKey: options.authorityPublicKey,
             parents: [endpoint],
-            followDirectory: false,
-            ...(options.report === undefined ? {} : { report: options.report })
+            followDirectory: false
         });
         links.set(nodeId, { endpoint, upstream });
         return upstream;
@@ -96,7 +105,10 @@ export function createPeerLinks(options: PeerLinksOptions): PeerLinks {
             return {
                 write: (address: string, change: Change) =>
                     new Promise<WriteOutcome>((resolve) => {
-                        const timer = setTimeout(() => resolve({ result: 'rejected', reason: `node ${nodeId} did not answer` }), writeTimeoutMs);
+                        const timer = setTimeout(() => {
+                            report.warning('Node %s did not answer a write of %s in %s ms', [nodeId, address, writeTimeoutMs]);
+                            resolve({ result: 'rejected', reason: `node ${nodeId} did not answer` });
+                        }, writeTimeoutMs);
                         (timer as { unref?: () => void }).unref?.();
                         void upstream.write(address, change).then((outcome) => {
                             clearTimeout(timer);
@@ -163,8 +175,12 @@ export function createPlacedUpstream(options: PlacedUpstreamOptions): Upstream {
                 closed: (reason) => {
                     current = undefined;
                     if (closed) return;
-                    if (reason === 'revoked' || tries >= attempts) return end(reason);
+                    if (reason === 'revoked' || tries >= attempts) {
+                        report(CATEGORY, 'Gave up following the owner of %s after %s attempts: %s', [address, tries, reason]);
+                        return end(reason);
+                    }
                     tries++;
+                    report(CATEGORY, 'The subscription to %s ended (%s): finding its owner again, attempt %s', [address, reason, tries]);
                     const timer = setTimeout(start, retryMs * tries);
                     (timer as { unref?: () => void }).unref?.();
                 }
@@ -175,6 +191,7 @@ export function createPlacedUpstream(options: PlacedUpstreamOptions): Upstream {
                     (placement) => {
                         if (closed) return;
                         const upstream = placement.here ? options.local : options.remote(placement.node);
+                        report(CATEGORY, 'Subscribing to %s %s at %s from revision %s', [address, prefix, placement.here ? 'this node' : placement.node, have ?? 0]);
                         if (upstream === undefined) return inner.closed?.(`node ${placement.here ? 'here' : placement.node} cannot be reached`);
                         current = upstream.subscribe(address, prefix, have, inner, access);
                     },
@@ -231,7 +248,6 @@ export interface OwnerMeshOptions {
     /** Checks the grants of reads by relays' listeners at this node's relay, with these keys; every read is served without it */
     readonly grants?: { keyOf: (kid: string) => GrantKey | undefined };
     readonly writeTimeoutMs?: number;
-    readonly report?: (message: string) => void;
 }
 
 export interface OwnerMesh {
@@ -271,8 +287,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
         certificate: options.certificate,
         authorityPublicKey: options.authorityPublicKey,
         directory: options.directory,
-        ...(options.writeTimeoutMs === undefined ? {} : { writeTimeoutMs: options.writeTimeoutMs }),
-        ...(options.report === undefined ? {} : { report: options.report })
+        ...(options.writeTimeoutMs === undefined ? {} : { writeTimeoutMs: options.writeTimeoutMs })
     });
     const node = new OwnerNode({
         id: options.nodeId,
@@ -314,8 +329,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
                       sessions,
                       handoff: (address, to) => node.handoff(address, to),
                       take: (address) => node.claim(address)
-                  },
-                  ...(options.report === undefined ? {} : { report: options.report })
+                  }
               });
     const mesh = await startMeshServer({
         nodeId: options.nodeId,
@@ -340,6 +354,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
         port: options.port ?? 0,
         ...(options.tls === undefined ? {} : { tls: options.tls })
     });
+    report(CATEGORY, 'Owner node %s started at %s with %s relays', [options.nodeId, mesh.url, options.relays?.length ?? 0]);
     return {
         nodeId: options.nodeId,
         node,
@@ -350,6 +365,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
         url: mesh.url,
         connect: async (address, connection, access, here) => {
             const placement = await node.place(address);
+            report(CATEGORY, 'Node %s connects a session of %s %s', [options.nodeId, address, placement.here ? 'here' : `through ${placement.node}`]);
             if (placement.here) return (await here()).connect(connection, access);
             const link = peers.link(placement.node);
             if (link === undefined) throw new Error(`node ${placement.node} cannot be reached`);
@@ -357,6 +373,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
         },
         directoryChanged: () => mesh.directoryChanged(),
         close: async () => {
+            report(CATEGORY, 'Owner node %s stops, owning %s namespaces', [options.nodeId, node.owned().length]);
             relay.close();
             await node.stop();
             peers.close();

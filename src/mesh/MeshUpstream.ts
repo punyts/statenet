@@ -1,3 +1,4 @@
+import { report } from '@punyts/core';
 import type { Change } from '@punyts/state-sync';
 import type { Access, AuthorityConnection, AuthoritySession, Handoff, RelayListener, RelaySubscription, StoredNamespace, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import WebSocket from 'ws';
@@ -10,6 +11,9 @@ import type { NodeCertificateClaims } from './certificates.js';
 import type { KeyPair, NodeRole } from './certificates.js';
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
 import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
+
+/** The category of the link up's reports: node ids, parent URLs and counts, never values */
+const CATEGORY = 'statenet.mesh';
 
 export interface MeshUpstreamOptions {
     readonly nodeId: string;
@@ -47,7 +51,6 @@ export interface MeshUpstreamOptions {
     /** How long a link may be silent before it is closed; 15 seconds by default (pings every third of it) */
     readonly silenceMs?: number;
     readonly onDirectory?: (directory: DirectoryView) => void;
-    readonly report?: (message: string) => void;
     readonly now?: () => number;
 }
 
@@ -233,10 +236,15 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         const mine = verifyNodeCertificate(held, options.authorityPublicKey, now());
         if (!mine.ok || mine.claims.expires - now() > renewWithinMs) return;
         nextRenewal = now() + 60_000;
+        report('statenet.certificate', 'Node %s asks its parent for its next certificate', [options.nodeId]);
         void certify(held).then((next) => {
             const checked = verifyNodeCertificate(next, options.authorityPublicKey, now());
-            if (next === undefined || !checked.ok || checked.claims.nodeId !== options.nodeId || checked.claims.role !== options.role || checked.claims.publicKey !== options.keys.publicKey) return;
+            if (next === undefined || !checked.ok || checked.claims.nodeId !== options.nodeId || checked.claims.role !== options.role || checked.claims.publicKey !== options.keys.publicKey) {
+                report.warning('Node %s was given no next certificate it can use', [options.nodeId]);
+                return;
+            }
             if (checked.claims.expires <= mine.claims.expires) return;
+            report('statenet.certificate', 'Node %s renewed its certificate', [options.nodeId]);
             held = next;
             options.onCertificate?.(next);
         });
@@ -299,6 +307,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             }
             case 'resync': {
                 const want = wanted.get(message.sid);
+                report(CATEGORY, 'The parent of %s asks it to catch %s up again', [options.nodeId, want?.address ?? 'a subscription']);
                 if (want !== undefined) queue(subscribeMessage(message.sid, want));
                 return;
             }
@@ -375,6 +384,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     };
 
     const dropped = (): void => {
+        report(CATEGORY, 'The link of %s to %s closed', [options.nodeId, current ?? 'its parent']);
         ready = false;
         socket = undefined;
         seal = undefined;
@@ -403,7 +413,9 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             ask.done(undefined);
         }
         if (closed) return;
-        timer = setTimeout(connect, backoff(attempt++));
+        const delay = backoff(attempt++);
+        report(CATEGORY, 'Node %s links up again in %s ms (attempt %s)', [options.nodeId, delay, attempt]);
+        timer = setTimeout(connect, delay);
         (timer as { unref?: () => void }).unref?.();
     };
 
@@ -412,14 +424,18 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         if (closed) return;
         const list = candidates();
         const url = list[attempt % Math.max(1, list.length)];
-        if (url === undefined) return;
+        if (url === undefined) {
+            report.warning('Node %s has no parent to link to', [options.nodeId]);
+            return;
+        }
+        report(CATEGORY, 'Node %s links to the parent at %s', [options.nodeId, url]);
         const nonce = newNonce();
         const mine = newShare();
         const link = new WebSocket(url);
         socket = link;
         seal = undefined;
         const refuse = (why: string): void => {
-            options.report?.(`Refused the parent at ${url}: ${why}`);
+            report.warning('Node %s refused the parent at %s: %s', [options.nodeId, url, why]);
             link.terminate();
         };
         // a parent that takes the socket and then says nothing is left for the next one
@@ -448,7 +464,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                     directory = first.directory;
                     options.onDirectory?.(first.directory);
                     current = url;
-                    options.report?.(`Linked to the parent at ${url}`);
+                    report(CATEGORY, 'Node %s linked to %s at %s: %s subscriptions and %s writes sent again', [options.nodeId, parent?.nodeId ?? 'its parent', url, wanted.size, writes.size]);
                     // what the parent asks of this node comes as `rev`, and is answered the same way
                     if (parent !== undefined) serving = createServing({ nodeId: options.nodeId, authorityPublicKey: options.authorityPublicKey, ...(options.serve ?? unserved) }, parent, (answer) => queue({ type: 'rev', message: answer }), () => ready && link === socket);
                     opened();
@@ -486,7 +502,9 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 parent = checked.claims;
                 return;
             }
-            if (message.type === 'link-refused') options.report?.(`The parent at ${url} refused the link: ${message.reason}`);
+            if (message.type === 'link-refused') {
+                report.warning('The parent at %s refused the link of %s: %s', [url, options.nodeId, message.reason]);
+            }
         });
         link.on('close', () => {
             clearTimeout(handshake);
@@ -579,6 +597,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 queue(loadMessage(lid, load));
             }),
         close: () => {
+            report(CATEGORY, 'Node %s closes its link up', [options.nodeId]);
             closed = true;
             for (const tunnel of tunnels.values()) tunnel.connection.close();
             tunnels.clear();

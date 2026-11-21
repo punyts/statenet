@@ -208,25 +208,31 @@ describe("startStatenet", () => {
         const left = await server.next((message) => message["type"] === "emit");
         expect(left).toEqual({ type: "emit", name: LEFT_EMIT, value: { clientId: "page-view" } });
     });
-    it("should report namespaces and revisions but never change values", async () => {
+    it("should report namespaces, clients and revisions under statenet.service and state-sync.authority, but never change values", async () => {
         // Arrange
         const lines: string[] = [];
         const listener = (_timestamp: number, category: string, message: string, details?: unknown): void => {
             lines.push(`${category} ${message} ${JSON.stringify(details ?? null)}`);
         };
-        setCategories(["statenet", "state-sync", "warning", "error"]);
-        addListener(listener);
+        setCategories(["statenet.*", "state-sync.*", "warning", "error"]);
+        addListener(listener, ["statenet.*", "state-sync.*", "warning", "error"]);
         const client = await open();
 
         // Act
-        await hello(client, "apps.secret", 0, "c");
-        client.send({ type: "change", change: { id: "c1", path: "$.data.password", op: "set", value: "hunter2-value", base: 0 } });
-        await client.next((message) => message["type"] === "ack");
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        removeListener(listener);
+        try {
+            await hello(client, "apps.secret", 0, "c");
+            client.send({ type: "change", change: { id: "c1", path: "$.data.password", op: "set", value: "hunter2-value", base: 0 } });
+            await client.next((message) => message["type"] === "ack");
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        } finally {
+            removeListener(listener, ["statenet.*", "state-sync.*", "warning", "error"]);
+            setCategories(["info", "error", "stack"]);
+        }
 
         // Assert
-        expect(lines.some((line) => line.includes("apps.secret"))).toBe(true);
+        expect(lines.some((line) => /^statenet\.service Loaded namespace apps\.secret at revision 0 in [\d.]+ ms /.test(line))).toBe(true);
+        expect(lines.some((line) => line.startsWith("statenet.service Client c joined apps.secret from an app server "))).toBe(true);
+        expect(lines.some((line) => line.startsWith("state-sync.authority Applied the set of client c at $.data.password in apps.secret at revision 1 "))).toBe(true);
         expect(lines.some((line) => line.includes("hunter2-value"))).toBe(false);
     });
 });

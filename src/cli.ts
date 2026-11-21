@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { addListener, setCategories } from "@punyts/core";
+import { startHostReporting } from "./hostReporting.js";
 import { HELP_TEXT, parseOptions, UsageError } from "./options.js";
 import { startStatenet } from "./Statenet.js";
 
@@ -20,12 +20,8 @@ const main = async (): Promise<void> => {
         return;
     }
 
-    // The statenet and state-sync report namespaces, revisions and errors, never change values
-    setCategories(["statenet", "state-sync", "warning", "error"]);
-    addListener((_timestamp, category, message) => {
-        // The reporter has put the details into the message already
-        process.stderr.write(`[${category}] ${message}\n`);
-    });
+    // statenet.*, state-sync.* and the operator's categories, with those PUNYTS_REPORT adds: paths, ids and counts, never values
+    startHostReporting("statenet", process.env);
 
     const statenet = await startStatenet({
         host: options.host,

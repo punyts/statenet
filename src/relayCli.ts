@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from 'node:fs/promises';
-import { addListener, setCategories } from '@punyts/core';
 import type { KeyPair } from './mesh/certificates.js';
 import { startRelayNode } from './mesh/RelayNode.js';
+import { startHostReporting } from './hostReporting.js';
 
 export const RELAY_HELP = `statenet-relay: a relay of the statenet's mesh, with no database
 
@@ -19,6 +19,9 @@ Usage: statenet-relay [options]
   --mesh-port <port>      The port relays below link to (4310)               STATENET_MESH_PORT
   --client-port <port>    The port browsers connect to (4311)                STATENET_CLIENT_PORT
   --help                  This text
+
+Reports go to stderr: statenet.*, state-sync.*, info, warning and error, and the categories PUNYTS_REPORT lists
+(comma-separated, such as PUNYTS_REPORT=state.set).
 `;
 
 /** Reads `--name value` flags, falling back to the environment variable */
@@ -43,8 +46,8 @@ const main = async (): Promise<void> => {
     const certificate = (await readFile(certificateFile, 'utf8')).trim();
     const authorityFile = read(argv, process.env, 'authority-key-file', 'STATENET_AUTHORITY_PUBLIC_KEY_FILE');
     const authorityPublicKey = authorityFile !== undefined && authorityFile !== '' ? (await readFile(authorityFile, 'utf8')).trim() : value('authority-key', 'STATENET_AUTHORITY_PUBLIC_KEY');
-    setCategories(['statenet', 'state-sync', 'warning', 'error']);
-    addListener((_timestamp, category, message) => process.stderr.write(`[${category}] ${message}\n`));
+    // statenet.*, state-sync.* and the operator's categories, with those PUNYTS_REPORT adds; the link up reports under statenet.mesh
+    startHostReporting('statenet-relay', process.env);
     const region = read(argv, process.env, 'region', 'STATENET_REGION');
     const relay = await startRelayNode({
         nodeId: value('node-id', 'STATENET_NODE_ID'),
@@ -62,8 +65,7 @@ const main = async (): Promise<void> => {
         parents: value('parents', 'STATENET_PARENTS').split(',').map((url) => url.trim()).filter((url) => url !== ''),
         host: read(argv, process.env, 'host', 'STATENET_HOST') ?? '127.0.0.1',
         meshPort: Number(read(argv, process.env, 'mesh-port', 'STATENET_MESH_PORT') ?? 4310),
-        clientPort: Number(read(argv, process.env, 'client-port', 'STATENET_CLIENT_PORT') ?? 4311),
-        upstream: { report: (message) => process.stderr.write(`statenet-relay: ${message}\n`) }
+        clientPort: Number(read(argv, process.env, 'client-port', 'STATENET_CLIENT_PORT') ?? 4311)
     });
     process.stderr.write(`statenet-relay: ${relay.nodeId}, links at ${relay.meshUrl}, browsers at ${relay.clientUrl ?? '(none)'}\n`);
     let stopping = false;

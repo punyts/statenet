@@ -3,7 +3,9 @@ import { createStoreBridge, createSyncClient } from '@punyts/state-sync';
 import type { Change, JsonValue, RevisedChange, SyncTransport } from '@punyts/state-sync';
 import { createAuthorityUpstream, createMemoryEpochStorage, createMemoryOwnershipStore, createRelay, generateGrantKey, OwnerNode, signGrant } from '@punyts/state-sync/authority';
 import type { RelayListener } from '@punyts/state-sync/authority';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { addListener, removeListener, setCategories } from '@punyts/core';
+import type { ListenerFn } from '@punyts/core';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { generateKeyPair, issueNodeCertificate } from './certificates.js';
 import type { KeyPair, NodeRole } from './certificates.js';
 import { namespaceOfAddress, startClientServer } from './ClientServer.js';
@@ -115,6 +117,24 @@ function follower(prefix: string) {
     return { listener, state };
 }
 
+/** The warnings and statenet reports heard during a test, from @punyts/core's reporter */
+const heard: string[] = [];
+const hear: ListenerFn = (_timestamp, _category, message) => {
+    heard.push(message);
+};
+const HEARD = ['warning', 'statenet.*'];
+beforeEach(() => {
+    heard.length = 0;
+    setCategories(['error', ...HEARD]);
+    addListener(hear, HEARD);
+});
+afterEach(() => {
+    removeListener(hear, HEARD);
+    setCategories(['info', 'error', 'stack']);
+});
+/** What was heard of a node: the reports that name it */
+const heardOf = (nodeId: string): string[] => heard.filter((line) => line.includes(nodeId));
+
 describe('the mesh', () => {
     it('should give a browser behind a regional relay the same changes, in the same order, as one at the server', async () => {
         // Arrange: owner, a core relay, and a regional relay below it
@@ -148,8 +168,7 @@ describe('the mesh', () => {
         await owner.write(ADDRESS, change('$.data.n', 0));
         const stranger = generateKeyPair();
         const otherAuthority = generateKeyPair();
-        const reports: string[] = [];
-        const forged = createMeshUpstream({ nodeId: 'forged', role: 'relay', keys: stranger, certificate: certificateFor('forged', 'relay', stranger, otherAuthority), authorityPublicKey: authority.publicKey, parents: [mesh.url], backoff: () => 50, report: (message) => reports.push(message) });
+        const forged = createMeshUpstream({ nodeId: 'forged', role: 'relay', keys: stranger, certificate: certificateFor('forged', 'relay', stranger, otherAuthority), authorityPublicKey: authority.publicKey, parents: [mesh.url], backoff: () => 50 });
         const none = createMeshUpstream({ nodeId: 'none', role: 'relay', keys: stranger, certificate: '', authorityPublicKey: authority.publicKey, parents: [mesh.url], backoff: () => 50 });
         closers.push(() => forged.close(), () => none.close());
 
@@ -160,7 +179,7 @@ describe('the mesh', () => {
         expect(forged.linked()).toBe(false);
         expect(none.linked()).toBe(false);
         expect(mesh.stats().links).toEqual([]);
-        expect(reports.some((report) => report.includes("not signed by Magnetic's certificate authority"))).toBe(true);
+        expect(heardOf('forged').some((line) => line.includes("not signed by Magnetic's certificate authority"))).toBe(true);
     });
 
     it('should let a slow node lag and catch up without the owner node holding more than its limit for it', async () => {
