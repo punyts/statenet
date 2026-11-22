@@ -231,6 +231,8 @@ export interface OwnerMeshOptions {
      * nodes of other groups and, for a node that saves through one, to the aggregate. None by default
      */
     readonly relays?: readonly string[];
+    /** Called each time the link to a relay opens, with the relay's node id: the node lists it as its `parent` */
+    readonly onUplinked?: (relayId: string) => void;
     /** Where ownership is kept (`PgOwnershipStore`) */
     readonly ownership: OwnershipStore;
     /** The node's authorities: an app server's own (with its logic and storage) */
@@ -323,6 +325,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
                   authorityPublicKey: options.authorityPublicKey,
                   parents: options.relays,
                   followDirectory: false,
+                  ...(options.onUplinked === undefined ? {} : { onLinked: options.onUplinked }),
                   serve: {
                       upstream: relay,
                       write: (address, change, _access, via) => node.write(address, change, via),

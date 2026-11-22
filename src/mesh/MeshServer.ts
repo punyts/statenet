@@ -61,6 +61,10 @@ export interface MeshServerOptions {
     readonly route?: ServingOptions['route'];
     /** The directory the nodes below learn; read when a link opens */
     readonly directory: () => DirectoryView;
+    /** Called when a node's link has opened (after its proof), with what its certificate says */
+    readonly onLinkOpened?: (peer: NodeCertificateClaims) => void;
+    /** Called when a link that opened has closed */
+    readonly onLinkClosed?: (peer: NodeCertificateClaims) => void;
     /**
      * The sessions of a namespace this node owns, for a peer that serves a view of it (an owner node of the same
      * statenet): the endpoint, or why not (it is owned elsewhere now). Without it a peer cannot open sessions here
@@ -236,6 +240,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                 report(CATEGORY, 'Node %s opened a link from %s (%s): %s links', [options.nodeId, opened.peer.nodeId, opened.peer.role, links.size]);
                 opened.scheduled = true;
                 queueMicrotask(() => flush(opened));
+                options.onLinkOpened?.(opened.peer);
                 return;
             }
             refuse('open the link with link-hello and link-proof first');
@@ -247,6 +252,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
             report(CATEGORY, 'The link from %s to node %s closed: %s links', [link.peer.nodeId, options.nodeId, links.size]);
             link.serving.close();
             link.client.close();
+            options.onLinkClosed?.(link.peer);
         });
         socket.on('error', () => undefined);
     });

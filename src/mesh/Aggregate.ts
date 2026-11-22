@@ -1,7 +1,7 @@
 import { report } from '@punyts/core';
 import { FencedError } from '@punyts/state-sync/authority';
 import type { EpochStorage, StoredNamespace, Upstream } from '@punyts/state-sync/authority';
-import type { KeyPair, NodeRole } from './certificates.js';
+import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
 import { startMeshServer } from './MeshServer.js';
 import type { MeshServer, MeshServerOptions } from './MeshServer.js';
 import type { DirectoryView, LoadOutcome, PersistOutcome, RemoveOutcome } from './protocol.js';
@@ -213,6 +213,27 @@ export function createAggregateStorage(link: AggregateLink, node?: string): Epoc
     };
 }
 
+/**
+ * A relay linked to an aggregate, as the directory lists it (docs/design/statenet-relay-directory.md): everything but
+ `parent` comes from the relay's certificate, and `parent` is the aggregate
+ */
+export interface ListedRelay {
+    readonly id: string;
+    readonly region: string;
+    readonly group: string;
+    readonly endpoint: string;
+    readonly publicKey: string;
+    readonly parent: string;
+}
+
+/** Where an aggregate lists the relays linked to it: the database's directory */
+export interface RelayListing {
+    /** The relay's first link opened: list it */
+    list(relay: ListedRelay): Promise<void>;
+    /** The relay's last link closed: take it out */
+    unlist(nodeId: string): Promise<void>;
+}
+
 export interface AggregateNodeOptions extends AggregateOptions {
     readonly nodeId: string;
     readonly keys: KeyPair;
@@ -229,6 +250,8 @@ export interface AggregateNodeOptions extends AggregateOptions {
     readonly requireListed?: readonly NodeRole[];
     readonly reread?: MeshServerOptions['reread'];
     readonly certify?: MeshServerOptions['certify'];
+    /** Lists the relays linked here while they are; without it nothing is listed */
+    readonly relays?: RelayListing;
 }
 
 export interface AggregateNode {
@@ -237,6 +260,8 @@ export interface AggregateNode {
     /** The aggregate itself, for a node in the same process */
     readonly aggregate: Aggregate;
     readonly mesh: MeshServer;
+    /** The relays linked here now, as they are listed */
+    relays(): ListedRelay[];
     close(): Promise<void>;
 }
 
@@ -256,6 +281,41 @@ const noSubscriptions: Upstream = {
  */
 export async function startAggregateNode(options: AggregateNodeOptions): Promise<AggregateNode> {
     const aggregate = createAggregate(options.storage, { ...(options.mayPersist === undefined ? {} : { mayPersist: options.mayPersist }) });
+    /** Each linked relay with its count of open links: a relay that dials again may open a link before its old one closes */
+    const linked = new Map<string, { relay: ListedRelay; links: number }>();
+    /** Each relay's listing and unlisting, in the order its links opened and closed */
+    const pending = new Map<string, Promise<void>>();
+    const inTurn = (id: string, step: () => Promise<void>, what: string): void => {
+        const next = (pending.get(id) ?? Promise.resolve())
+            .then(step)
+            .catch((error: unknown) => report.warning('Aggregate %s could not %s relay %s: %s', [options.nodeId, what, id, error instanceof Error ? error.name : 'error']));
+        pending.set(id, next);
+        void next.then(() => {
+            if (pending.get(id) === next) pending.delete(id);
+        });
+    };
+    const listing = options.relays;
+    const opened = (peer: NodeCertificateClaims): void => {
+        if (peer.role !== 'relay' || listing === undefined) return;
+        const known = linked.get(peer.nodeId);
+        if (known !== undefined) {
+            known.links += 1;
+            return;
+        }
+        const relay: ListedRelay = { id: peer.nodeId, region: peer.region, group: peer.group ?? '', endpoint: peer.endpoint ?? '', publicKey: peer.publicKey, parent: options.nodeId };
+        linked.set(peer.nodeId, { relay, links: 1 });
+        report(CATEGORY, 'Aggregate %s lists relay %s of group %s', [options.nodeId, relay.id, relay.group]);
+        inTurn(relay.id, () => listing.list(relay), 'list');
+    };
+    const closed = (peer: NodeCertificateClaims): void => {
+        const known = peer.role === 'relay' && listing !== undefined ? linked.get(peer.nodeId) : undefined;
+        if (known === undefined || listing === undefined) return;
+        known.links -= 1;
+        if (known.links > 0) return;
+        linked.delete(peer.nodeId);
+        report(CATEGORY, 'Aggregate %s takes relay %s out of the directory', [options.nodeId, peer.nodeId]);
+        inTurn(peer.nodeId, () => listing.unlist(peer.nodeId), 'unlist');
+    };
     const mesh = await startMeshServer({
         nodeId: options.nodeId,
         role: 'aggregate',
@@ -273,13 +333,19 @@ export async function startAggregateNode(options: AggregateNodeOptions): Promise
         ...(options.tls === undefined ? {} : { tls: options.tls }),
         ...(options.requireListed === undefined ? {} : { requireListed: options.requireListed }),
         ...(options.reread === undefined ? {} : { reread: options.reread }),
-        ...(options.certify === undefined ? {} : { certify: options.certify })
+        ...(options.certify === undefined ? {} : { certify: options.certify }),
+        onLinkOpened: opened,
+        onLinkClosed: closed
     });
     return {
         nodeId: options.nodeId,
         url: mesh.url,
         aggregate,
         mesh,
-        close: () => mesh.close()
+        relays: () => [...linked.values()].map((entry) => entry.relay),
+        close: async () => {
+            await mesh.close();
+            await Promise.all([...pending.values()]);
+        }
     };
 }

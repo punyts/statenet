@@ -369,6 +369,19 @@ describe('the next certificate over the link', () => {
         expect(expiryOf(passedOn as string)).toBeGreaterThan(expiryOf(below.upstream.certificate()));
     });
 
+    it('should keep the group and endpoint of a relay in its renewed certificate', () => {
+        // Arrange
+        const keys = generateKeyPair();
+        const first = issueNodeCertificate({ nodeId: 'relay-1', role: 'relay', region: 'east', group: 'shop', endpoint: 'wss://relay-1.example:4310', publicKey: keys.publicKey, expires: Date.now() + HOUR }, authority.privateKey);
+
+        // Act
+        const renewed = renewNodeCertificate(first, authority, Date.now() + 24 * HOUR, Date.now());
+        const checked = verifyNodeCertificate(renewed, authority.publicKey, Date.now());
+
+        // Assert
+        expect(checked.ok && checked.claims).toMatchObject({ nodeId: 'relay-1', group: 'shop', endpoint: 'wss://relay-1.example:4310' });
+    });
+
     it('should not renew a certificate another authority signed, or one that has ended', () => {
         // Arrange
         const keys = generateKeyPair();

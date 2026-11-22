@@ -51,6 +51,8 @@ export interface MeshUpstreamOptions {
     /** How long a link may be silent before it is closed; 15 seconds by default (pings every third of it) */
     readonly silenceMs?: number;
     readonly onDirectory?: (directory: DirectoryView) => void;
+    /** Called each time a link to a parent opens, with the parent's node id (a node lists it as its `parent`) */
+    readonly onLinked?: (parentId: string) => void;
     readonly now?: () => number;
 }
 
@@ -468,6 +470,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                     // what the parent asks of this node comes as `rev`, and is answered the same way
                     if (parent !== undefined) serving = createServing({ nodeId: options.nodeId, authorityPublicKey: options.authorityPublicKey, ...(options.serve ?? unserved) }, parent, (answer) => queue({ type: 'rev', message: answer }), () => ready && link === socket);
                     opened();
+                    if (parent !== undefined) options.onLinked?.(parent.nodeId);
                     ping = setInterval(() => {
                         if (now() - lastHeard > silenceMs) link.terminate();
                         else {

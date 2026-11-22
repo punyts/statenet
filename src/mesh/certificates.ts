@@ -22,6 +22,11 @@ export interface NodeCertificateClaims {
      * (docs/design/statenet-network.md, "Groups"). Nodes link to each other only inside a group
      */
     readonly group?: string;
+    /**
+     * Where other relays reach a relay (`wss://relay-1.example:4310`), which the directory lists
+     * (docs/design/statenet-relay-directory.md). Only a relay has one
+     */
+    readonly endpoint?: string;
     /** The node's own public key (SPKI DER, base64url), with which it proves it is the node in its links */
     readonly publicKey: string;
     readonly expires: number;
@@ -75,14 +80,14 @@ export const verifyNodeCertificate = (certificate: unknown, authorityPublicKey: 
 
 /**
  * The same certificate with a later end (docs/design/statenet-network.md: certificates are short, and a node asks for
- * its next one over its link): the node, role, region and key stay as the authority first signed them. Undefined when
+ * its next one over its link): the node, role, region, group, endpoint and key stay as the authority first signed them. Undefined when
  * the certificate is not one the authority signed, or has ended
  */
 export const renewNodeCertificate = (certificate: unknown, authority: KeyPair, expires: number, now: number): string | undefined => {
     const checked = verifyNodeCertificate(certificate, authority.publicKey, now);
     if (!checked.ok) return undefined;
-    const { nodeId, role, region, publicKey, group } = checked.claims;
-    return issueNodeCertificate({ nodeId, role, region, publicKey, expires, ...(group === undefined ? {} : { group }) }, authority.privateKey);
+    const { nodeId, role, region, publicKey, group, endpoint } = checked.claims;
+    return issueNodeCertificate({ nodeId, role, region, publicKey, expires, ...(group === undefined ? {} : { group }), ...(endpoint === undefined ? {} : { endpoint }) }, authority.privateKey);
 };
 
 /** A fresh challenge for the other end of a link to sign */

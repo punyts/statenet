@@ -384,3 +384,64 @@ describe('epoch storage in files', () => {
         expect(await second.load('alice/other/user')).toBeUndefined();
     });
 });
+
+describe('an aggregate that lists its relays', () => {
+    it('should list a relay from its certificate when its link opens, and take it out when the link closes', async () => {
+        // Arrange
+        const listed: unknown[] = [];
+        const unlisted: string[] = [];
+        const aggregateKeys = generateKeyPair();
+        const aggregate = await startAggregateNode({
+            nodeId: 'aggregate-1',
+            keys: aggregateKeys,
+            certificate: certificateFor('aggregate-1', 'aggregate', aggregateKeys),
+            authorityPublicKey: authority.publicKey,
+            storage: createMemoryEpochStorage(),
+            relays: {
+                list: async (relay) => void listed.push(relay),
+                unlist: async (nodeId) => void unlisted.push(nodeId)
+            }
+        });
+        closers.push(() => aggregate.close());
+        const relayKeys = generateKeyPair();
+        const certificate = issueNodeCertificate({ nodeId: 'relay-1', role: 'relay', region: 'east', group: 'shop', endpoint: 'wss://relay-1.example:4310', publicKey: relayKeys.publicKey, expires: Date.now() + HOUR }, authority.privateKey);
+
+        // Act
+        const relay = await startRelayNode({ nodeId: 'relay-1', region: 'east', keys: relayKeys, certificate, authorityPublicKey: authority.publicKey, parents: [aggregate.url], checkGrants: false, upstream: { renewWithinMs: 0, followDirectory: false } });
+        await vi.waitFor(() => expect(listed).toHaveLength(1));
+        const whileLinked = aggregate.relays().map((each) => each.id);
+        await relay.close();
+        await vi.waitFor(() => expect(unlisted).toEqual(['relay-1']));
+
+        // Assert
+        expect(listed).toEqual([{ id: 'relay-1', region: 'east', group: 'shop', endpoint: 'wss://relay-1.example:4310', publicKey: relayKeys.publicKey, parent: 'aggregate-1' }]);
+        expect(whileLinked).toEqual(['relay-1']);
+        expect(aggregate.relays()).toEqual([]);
+    });
+
+    it('should list a relay whose certificate names no group or endpoint with empty ones', async () => {
+        // Arrange
+        const listed: unknown[] = [];
+        const { storage } = gatedStorage();
+        const aggregateKeys = generateKeyPair();
+        const aggregate = await startAggregateNode({
+            nodeId: 'aggregate-1',
+            keys: aggregateKeys,
+            certificate: certificateFor('aggregate-1', 'aggregate', aggregateKeys),
+            authorityPublicKey: authority.publicKey,
+            storage,
+            relays: { list: async (relay) => void listed.push(relay), unlist: async () => undefined }
+        });
+        closers.push(() => aggregate.close());
+        const relayKeys = generateKeyPair();
+
+        // Act
+        const relay = await startRelayNode({ nodeId: 'relay-1', keys: relayKeys, certificate: certificateFor('relay-1', 'relay', relayKeys), authorityPublicKey: authority.publicKey, parents: [aggregate.url], checkGrants: false, upstream: { renewWithinMs: 0, followDirectory: false } });
+        closers.push(() => relay.close());
+        await vi.waitFor(() => expect(relay.upstream.linked()).toBe(true));
+        await vi.waitFor(() => expect(listed).toHaveLength(1));
+
+        // Assert
+        expect(listed).toEqual([expect.objectContaining({ id: 'relay-1', group: '', endpoint: '' })]);
+    });
+});

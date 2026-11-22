@@ -1,3 +1,4 @@
+import { createServer } from 'node:net';
 import { createStore } from '@punyts/state';
 import { createStoreBridge, createSyncClient } from '@punyts/state-sync';
 import type { Change, JsonValue, SyncTransport } from '@punyts/state-sync';
@@ -29,8 +30,19 @@ afterEach(async () => {
 let counter = 0;
 const change = (path: string, value: unknown): Change => ({ id: `g${++counter}`, path, op: 'set', value: value as never, base: 0 });
 
-const certificate = (nodeId: string, role: NodeRole, publicKey: string, group?: string): string =>
-    issueNodeCertificate({ nodeId, role, region: '', publicKey, expires: Date.now() + HOUR, ...(group === undefined ? {} : { group }) }, ca.privateKey);
+const certificate = (nodeId: string, role: NodeRole, publicKey: string, group?: string, endpoint?: string): string =>
+    issueNodeCertificate({ nodeId, role, region: '', publicKey, expires: Date.now() + HOUR, ...(group === undefined ? {} : { group }), ...(endpoint === undefined ? {} : { endpoint }) }, ca.privateKey);
+
+/** A port free a moment ago, for a relay whose certificate must name its endpoint before it starts */
+const freePort = (): Promise<number> =>
+    new Promise((resolve, reject) => {
+        const server = createServer();
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+            const { port } = server.address() as { port: number };
+            server.close(() => resolve(port));
+        });
+    });
 
 /** A node's authorities over a storage: one shared by the servers, or each node's way to the aggregate */
 function hostOver(storageOf: () => EpochStorage) {
@@ -63,22 +75,36 @@ interface Placed {
 /**
  * An aggregate, a relay per group linked to it, and nodes each linked up to its group's relay: nodes of one group also
  * link to each other. `throughAggregate` has the nodes save through their relay to the aggregate; otherwise they share
- * a storage, as servers on one database do
+ * a storage, as servers on one database do. `selfListed` writes no row by hand: the aggregate lists the relays linked to
+ * it from their certificates, which name their endpoints, and each node lists the relay its link reached as its parent
  */
-async function statenet(placed: readonly Placed[], throughAggregate = false) {
+async function statenet(placed: readonly Placed[], throughAggregate = false, selfListed = false) {
     const ownership: OwnershipStore = createMemoryOwnershipStore();
     const database = createMemoryEpochStorage();
     const entries: Array<DirectoryView['nodes'][number]> = [];
     const directory = (): DirectoryView => ({ nodes: entries, owners: {}, keys: {} });
     const aggregateKeys = generateKeyPair();
-    const aggregate = await startAggregateNode({ nodeId: 'aggregate', keys: aggregateKeys, certificate: certificate('aggregate', 'aggregate', aggregateKeys.publicKey), authorityPublicKey: ca.publicKey, storage: database, directory });
+    const unlist = (id: string): void => {
+        const at = entries.findIndex((entry) => entry.id === id);
+        if (at >= 0) entries.splice(at, 1);
+    };
+    const relayListing = {
+        list: async (relay: { id: string; region: string; group: string; endpoint: string; publicKey: string; parent: string }) => {
+            unlist(relay.id);
+            entries.push({ id: relay.id, role: 'relay', region: relay.region, endpoint: relay.endpoint, group: relay.group, parent: relay.parent, publicKey: relay.publicKey });
+        },
+        unlist: async (id: string) => unlist(id)
+    };
+    const aggregate = await startAggregateNode({ nodeId: 'aggregate', keys: aggregateKeys, certificate: certificate('aggregate', 'aggregate', aggregateKeys.publicKey), authorityPublicKey: ca.publicKey, storage: database, directory, ...(selfListed ? { relays: relayListing } : {}) });
     closers.push(() => aggregate.close());
     const relays = new Map<string, RelayNode>();
     for (const id of new Set(placed.map((node) => node.relay))) {
         const keys = generateKeyPair();
-        const relay = await startRelayNode({ nodeId: id, keys, certificate: certificate(id, 'relay', keys.publicKey), authorityPublicKey: ca.publicKey, parents: [aggregate.url], checkGrants: false, upstream: { renewWithinMs: 0, followDirectory: false } });
+        const port = selfListed ? await freePort() : 0;
+        const relayCertificate = selfListed ? certificate(id, 'relay', keys.publicKey, undefined, `ws://127.0.0.1:${port}`) : certificate(id, 'relay', keys.publicKey);
+        const relay = await startRelayNode({ nodeId: id, keys, certificate: relayCertificate, authorityPublicKey: ca.publicKey, parents: [aggregate.url], checkGrants: false, meshPort: port, upstream: { renewWithinMs: 0, followDirectory: false } });
         relays.set(id, relay);
-        entries.push({ id, role: 'relay', region: '', endpoint: relay.meshUrl });
+        if (!selfListed) entries.push({ id, role: 'relay', region: '', endpoint: relay.meshUrl });
         closers.push(() => relay.close());
     }
     const nodes = new Map<string, OwnerMesh>();
@@ -96,11 +122,20 @@ async function statenet(placed: readonly Placed[], throughAggregate = false) {
             host,
             directory,
             relays: [(relays.get(relay) as RelayNode).meshUrl],
+            ...(selfListed
+                ? {
+                      onUplinked: (parent: string) => {
+                          unlist(id);
+                          entries.push({ id, role: 'owner', region: '', endpoint: (mesh as OwnerMesh).url, group, parent });
+                          aggregate.mesh.directoryChanged();
+                      }
+                  }
+                : {}),
             leaseMs: 10_000,
             writeTimeoutMs: 3_000
         });
         const made = mesh;
-        entries.push({ id, role: 'owner', region: '', endpoint: made.url, group, parent: relay });
+        if (!selfListed) entries.push({ id, role: 'owner', region: '', endpoint: made.url, group, parent: relay });
         nodes.set(id, made);
         closers.push(() => made.close());
     }
@@ -108,6 +143,8 @@ async function statenet(placed: readonly Placed[], throughAggregate = false) {
     aggregate.mesh.directoryChanged();
     await vi.waitFor(() => {
         for (const node of nodes.values()) expect(node.uplink?.linked()).toBe(true);
+        expect(entries).toHaveLength(relays.size + nodes.size);
+        aggregate.mesh.directoryChanged();
         for (const relay of relays.values()) expect(relay.upstream.directory()?.nodes).toHaveLength(entries.length);
     });
     return { nodes: (id: string) => nodes.get(id) as OwnerMesh, relays: (id: string) => relays.get(id) as RelayNode, aggregate, database, ownership };
@@ -214,6 +251,20 @@ describe('nodes in groups', () => {
         expect((await nodes('b1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ first: 1, second: 2 });
         expect(nodes('b1').mesh.stats().links).toEqual([]);
         expect(relays('relay-b').mesh.stats().links.map((link) => link.nodeId).sort()).toEqual(['b1', 'relay-a']);
+    });
+
+    it('should carry a write to a node of another group with a directory the aggregate and the nodes wrote themselves', async () => {
+        // Arrange
+        const { nodes, aggregate } = await statenet(TWO_GROUPS, false, true);
+        await nodes('b1').node.write(ADDRESS, change('$.data.first', 1));
+
+        // Act
+        const outcome = await nodes('a1').node.write(ADDRESS, change('$.data.second', 2));
+
+        // Assert
+        expect(outcome).toMatchObject({ result: 'applied', epoch: 1 });
+        expect((await nodes('b1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ first: 1, second: 2 });
+        expect(aggregate.relays().map((relay) => relay.id).sort()).toEqual(['relay-a', 'relay-b']);
     });
 
     it('should tunnel a view to the owner in another group through the relays, with its writes', async () => {

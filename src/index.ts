@@ -19,7 +19,7 @@ export type { MeshUpstream, MeshUpstreamOptions } from "./mesh/MeshUpstream.js";
 export { addressOfNamespace, namespaceOfAddress, startClientServer } from "./mesh/ClientServer.js";
 export type { ClientServer, ClientServerOptions } from "./mesh/ClientServer.js";
 export { createAggregate, createAggregateStorage, startAggregateNode } from "./mesh/Aggregate.js";
-export type { Aggregate, AggregateLink, AggregateNode, AggregateNodeOptions, AggregateOptions, AggregateStats } from "./mesh/Aggregate.js";
+export type { Aggregate, AggregateLink, AggregateNode, AggregateNodeOptions, AggregateOptions, AggregateStats, ListedRelay, RelayListing } from "./mesh/Aggregate.js";
 export { createFileEpochStorage, EPOCH_FILE } from "./FileEpochStorage.js";
 export type { LoadOutcome, PersistOutcome, RemoveOutcome } from "./mesh/protocol.js";
 export type { AggregateStorageBackend } from "./mesh/Aggregate.js";
