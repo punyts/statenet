@@ -10,6 +10,7 @@ import type { RouteTarget, Serving, ServingOptions } from './serving.js';
 import type { NodeCertificateClaims } from './certificates.js';
 import type { KeyPair, NodeRole } from './certificates.js';
 import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
+import { createRelayTree } from './relayTree.js';
 import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 
 /** The category of the link up's reports: node ids, parent URLs and counts, never values */
@@ -40,6 +41,8 @@ export interface MeshUpstreamOptions {
     readonly onCertificate?: (certificate: string) => void;
     /** The parents to link to, in order of preference; more are learned from the directory */
     readonly parents: readonly string[];
+    /** A relay's link to another relay, to reach the nodes below it: the other end does not take this node as its child */
+    readonly routing?: boolean;
     /** Whether to try the nodes the directory names when the parents do not answer; true by default (a peer link to one node: false) */
     readonly followDirectory?: boolean;
     /** Credits granted at a time: how many subscription messages may be in flight; 256 by default */
@@ -105,6 +108,13 @@ export interface MeshUpstream extends Upstream {
     remove(address: string, epoch: number, node?: string): Promise<RemoveOutcome>;
     /** Asks the parent for a certificate's next one (this node's, or one a node below asked for); undefined when it gives none */
     certify(certificate: string): Promise<string | undefined>;
+    /**
+     * A relay linked below this relay (`via` this one) or below one of its children, passed up toward the aggregate
+     * (docs/design/statenet-relay-chains.md), and sent up again each time the link opens again
+     */
+    relayLinked(id: string, certificate: string, via: string): void;
+    /** Relay `id` is no longer linked to `via`: neither it nor the relays under it are sent up again */
+    relayUnlinked(id: string, via: string): void;
     close(): void;
 }
 
@@ -150,6 +160,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     let nextWid = 1;
     let socket: WebSocket | undefined;
     let ready = false;
+    /** The relays below this one, with the certificate each proved where it is linked */
+    const below = createRelayTree<string>(options.nodeId);
     let current: string | undefined;
     let directory: DirectoryView | undefined;
     let attempt = 0;
@@ -267,6 +279,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         for (const [pid, save] of persists) queue(persistMessage(pid, save));
         for (const [lid, load] of loads) queue(loadMessage(lid, load));
         for (const [lid, removal] of removals) queue(removeMessage(lid, removal));
+        for (const relay of below.walk()) queue({ type: 'relay-linked', certificate: relay.value, via: relay.parent });
         sendAsks();
     };
 
@@ -446,7 +459,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         }, Math.max(1_000, silenceMs));
         (handshake as { unref?: () => void }).unref?.();
         link.on('open', () => {
-            send({ type: 'link-hello', nodeId: options.nodeId, role: options.role, protocol: MESH_PROTOCOL, region: options.region ?? '', certificate: certificateNow(), nonce, share: mine.share });
+            send({ type: 'link-hello', nodeId: options.nodeId, role: options.role, protocol: MESH_PROTOCOL, region: options.region ?? '', certificate: certificateNow(), nonce, share: mine.share, ...(options.routing === true ? { routing: true } : {}) });
         });
         link.on('message', (data, isBinary) => {
             if (link !== socket) return;
@@ -575,6 +588,14 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             }),
         certificate: certificateNow,
         certify,
+        relayLinked: (id, certificate, via) => {
+            if (below.link(id, via, certificate)) queue({ type: 'relay-linked', certificate, via });
+        },
+        relayUnlinked: (id, via) => {
+            if (below.parentOf(id) !== via) return;
+            below.unlink(id);
+            queue({ type: 'relay-unlinked', id, via });
+        },
         persist: (address, stored, epoch, node) =>
             new Promise((done) => {
                 if (closed) return done({ result: 'failed', reason: 'the link is closed' });

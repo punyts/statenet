@@ -76,9 +76,10 @@ interface Placed {
  * An aggregate, a relay per group linked to it, and nodes each linked up to its group's relay: nodes of one group also
  * link to each other. `throughAggregate` has the nodes save through their relay to the aggregate; otherwise they share
  * a storage, as servers on one database do. `selfListed` writes no row by hand: the aggregate lists the relays linked to
- * it from their certificates, which name their endpoints, and each node lists the relay its link reached as its parent
+ * it from their certificates, which name their endpoints, and each node lists the relay its link reached as its parent.
+ * `under` links a relay to another relay instead of the aggregate (relays under relays; the parent is placed first)
  */
-async function statenet(placed: readonly Placed[], throughAggregate = false, selfListed = false) {
+async function statenet(placed: readonly Placed[], throughAggregate = false, selfListed = false, under: Readonly<Record<string, string>> = {}) {
     const ownership: OwnershipStore = createMemoryOwnershipStore();
     const database = createMemoryEpochStorage();
     const entries: Array<DirectoryView['nodes'][number]> = [];
@@ -95,14 +96,16 @@ async function statenet(placed: readonly Placed[], throughAggregate = false, sel
         },
         unlist: async (id: string) => unlist(id)
     };
-    const aggregate = await startAggregateNode({ nodeId: 'aggregate', keys: aggregateKeys, certificate: certificate('aggregate', 'aggregate', aggregateKeys.publicKey), authorityPublicKey: ca.publicKey, storage: database, directory, ...(selfListed ? { relays: relayListing } : {}) });
+    const aggregatePort = await freePort();
+    const startAggregate = () => startAggregateNode({ nodeId: 'aggregate', keys: aggregateKeys, certificate: certificate('aggregate', 'aggregate', aggregateKeys.publicKey), authorityPublicKey: ca.publicKey, storage: database, directory, port: aggregatePort, ...(selfListed ? { relays: relayListing } : {}) });
+    let aggregate = await startAggregate();
     closers.push(() => aggregate.close());
     const relays = new Map<string, RelayNode>();
     for (const id of new Set(placed.map((node) => node.relay))) {
         const keys = generateKeyPair();
         const port = selfListed ? await freePort() : 0;
         const relayCertificate = selfListed ? certificate(id, 'relay', keys.publicKey, undefined, `ws://127.0.0.1:${port}`) : certificate(id, 'relay', keys.publicKey);
-        const relay = await startRelayNode({ nodeId: id, keys, certificate: relayCertificate, authorityPublicKey: ca.publicKey, parents: [aggregate.url], checkGrants: false, meshPort: port, upstream: { renewWithinMs: 0, followDirectory: false } });
+        const relay = await startRelayNode({ nodeId: id, keys, certificate: relayCertificate, authorityPublicKey: ca.publicKey, parents: [under[id] === undefined ? aggregate.url : (relays.get(under[id]) as RelayNode).meshUrl], checkGrants: false, meshPort: port, upstream: { renewWithinMs: 0, followDirectory: false, backoff: () => 50 } });
         relays.set(id, relay);
         if (!selfListed) entries.push({ id, role: 'relay', region: '', endpoint: relay.meshUrl });
         closers.push(() => relay.close());
@@ -147,7 +150,20 @@ async function statenet(placed: readonly Placed[], throughAggregate = false, sel
         aggregate.mesh.directoryChanged();
         for (const relay of relays.values()) expect(relay.upstream.directory()?.nodes).toHaveLength(entries.length);
     });
-    return { nodes: (id: string) => nodes.get(id) as OwnerMesh, relays: (id: string) => relays.get(id) as RelayNode, aggregate, database, ownership };
+    return {
+        nodes: (id: string) => nodes.get(id) as OwnerMesh,
+        relays: (id: string) => relays.get(id) as RelayNode,
+        aggregate: () => aggregate,
+        /** The aggregate stops, closing every relay's link to it */
+        stopAggregate: () => aggregate.close(),
+        /** A new aggregate at the same address: the relays link to it again */
+        startAggregate: async () => {
+            aggregate = await startAggregate();
+        },
+        directory: entries,
+        database,
+        ownership
+    };
 }
 
 /** A view: a sync client whose connection is a session a node gives it, here or tunnelled to the owner */
@@ -264,7 +280,7 @@ describe('nodes in groups', () => {
         // Assert
         expect(outcome).toMatchObject({ result: 'applied', epoch: 1 });
         expect((await nodes('b1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ first: 1, second: 2 });
-        expect(aggregate.relays().map((relay) => relay.id).sort()).toEqual(['relay-a', 'relay-b']);
+        expect(aggregate().relays().map((relay) => relay.id).sort()).toEqual(['relay-a', 'relay-b']);
     });
 
     it('should tunnel a view to the owner in another group through the relays, with its writes', async () => {
@@ -345,8 +361,91 @@ describe('nodes in groups', () => {
 
         // Assert
         expect((await database.load(ADDRESS))?.state).toEqual({ data: { n: 1 } });
-        expect(aggregate.aggregate.stats().saves).toBeGreaterThan(0);
+        expect(aggregate().aggregate.stats().saves).toBeGreaterThan(0);
         expect(claimed).toBe(true);
         expect((await nodes('b1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ n: 1 });
+    });
+});
+
+describe('relays under relays', () => {
+    /** Relay b is linked to relay a, relay a to the aggregate; a node of each group under each relay */
+    const CHAIN: readonly Placed[] = [
+        { id: 'a1', group: 'a', relay: 'relay-a' },
+        { id: 'b1', group: 'b', relay: 'relay-b' }
+    ];
+    const parents = (directory: ReadonlyArray<{ id: string; role: string; parent?: string }>): Array<[string, string | undefined]> =>
+        directory
+            .filter((entry) => entry.role === 'relay')
+            .map((entry): [string, string | undefined] => [entry.id, entry.parent])
+            .sort();
+
+    it('should list a relay under a relay with its parent, and carry a write, a subscription and a claim between the nodes below them', async () => {
+        // Arrange
+        const { nodes, aggregate, directory, ownership } = await statenet(CHAIN, false, true, { 'relay-b': 'relay-a' });
+        await nodes('b1').node.write(ADDRESS, change('$.data.n', 0));
+        const seen: { value: JsonValue | undefined } = { value: undefined };
+        const listener: RelayListener = {
+            welcome: (welcome) => {
+                if ('value' in welcome) seen.value = structuredClone(welcome.value);
+            },
+            changes: (batch) => {
+                for (const one of batch.changes) if (one.path === '$.data.n') (seen.value as { data: { n: unknown } }).data.n = one.value;
+            }
+        };
+
+        // Act
+        const written = await nodes('a1').node.write(ADDRESS, change('$.data.fromA', true));
+        nodes('a1').relay.subscribe(ADDRESS, '$', undefined, listener, { subject: 'a1' });
+        await vi.waitFor(() => expect(seen.value).toMatchObject({ data: { n: 0 } }));
+        await nodes('b1').node.write(ADDRESS, change('$.data.n', 1));
+        await vi.waitFor(() => expect(seen.value).toMatchObject({ data: { n: 1 } }));
+        const claimed = await nodes('a1').node.claim(ADDRESS);
+
+        // Assert
+        expect(parents(directory)).toEqual([
+            ['relay-a', 'aggregate'],
+            ['relay-b', 'relay-a']
+        ]);
+        expect(aggregate().relays().map((relay) => [relay.id, relay.parent])).toEqual([
+            ['relay-a', 'aggregate'],
+            ['relay-b', 'relay-a']
+        ]);
+        expect(written).toMatchObject({ result: 'applied' });
+        expect(claimed).toBe(true);
+        expect((await ownership.get(ADDRESS))?.node).toBe('a1');
+        expect((await nodes('a1').node.authorityOf(ADDRESS))?.get('$.data')).toEqual({ n: 1, fromA: true });
+    });
+
+    it('should unlist the relay under a relay when that relay loses its link to the aggregate, and list it again when the link comes back', async () => {
+        // Arrange
+        const { directory, stopAggregate, startAggregate, relays } = await statenet(CHAIN, false, true, { 'relay-b': 'relay-a' });
+
+        // Act
+        await stopAggregate();
+        await vi.waitFor(() => expect(parents(directory)).toEqual([]));
+        await startAggregate();
+
+        // Assert
+        await vi.waitFor(() =>
+            expect(parents(directory)).toEqual([
+                ['relay-a', 'aggregate'],
+                ['relay-b', 'relay-a']
+            ])
+        );
+        expect(relays('relay-b').upstream.parentId()).toBe('relay-a');
+    });
+
+    it('should list no relay a relay below passes up with a certificate the authority did not sign', async () => {
+        // Arrange
+        const { aggregate, relays } = await statenet(CHAIN, false, true, { 'relay-b': 'relay-a' });
+        const forger = generateKeyPair();
+        const forged = issueNodeCertificate({ nodeId: 'relay-x', role: 'relay', region: '', publicKey: forger.publicKey, expires: Date.now() + HOUR }, forger.privateKey);
+
+        // Act
+        relays('relay-a').upstream.relayLinked('relay-x', forged, 'relay-a');
+        await vi.waitFor(() => expect(heardOf('relay-x').concat(heard.filter((line) => line.includes('lists no relay'))).length).toBeGreaterThan(0));
+
+        // Assert
+        expect(aggregate().relays().map((relay) => relay.id)).toEqual(['relay-a', 'relay-b']);
     });
 });

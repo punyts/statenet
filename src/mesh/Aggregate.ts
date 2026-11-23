@@ -1,10 +1,12 @@
 import { report } from '@punyts/core';
 import { FencedError } from '@punyts/state-sync/authority';
 import type { EpochStorage, StoredNamespace, Upstream } from '@punyts/state-sync/authority';
+import { verifyNodeCertificate } from './certificates.js';
 import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
 import { startMeshServer } from './MeshServer.js';
-import type { MeshServer, MeshServerOptions } from './MeshServer.js';
+import type { MeshServer, MeshServerOptions, OpenedLink } from './MeshServer.js';
 import type { DirectoryView, LoadOutcome, PersistOutcome, RemoveOutcome } from './protocol.js';
+import { createRelayTree } from './relayTree.js';
 
 /** The category of an aggregate's reports: addresses, epochs, revisions, counts and durations, never values */
 const CATEGORY = 'statenet.aggregate';
@@ -214,8 +216,9 @@ export function createAggregateStorage(link: AggregateLink, node?: string): Epoc
 }
 
 /**
- * A relay linked to an aggregate, as the directory lists it (docs/design/statenet-relay-directory.md): everything but
- `parent` comes from the relay's certificate, and `parent` is the aggregate
+ * A relay of the aggregate's tree, as the directory lists it (docs/design/statenet-relay-directory.md,
+ * docs/design/statenet-relay-chains.md): everything but `parent` comes from the relay's certificate, and `parent` is
+ * the aggregate for a relay linked to it, or the relay it is linked to for one further down
  */
 export interface ListedRelay {
     readonly id: string;
@@ -228,9 +231,9 @@ export interface ListedRelay {
 
 /** Where an aggregate lists the relays linked to it: the database's directory */
 export interface RelayListing {
-    /** The relay's first link opened: list it */
+    /** The relay's first link opened, here or on a relay of the tree: list it */
     list(relay: ListedRelay): Promise<void>;
-    /** The relay's last link closed: take it out */
+    /** The relay's last link closed, or the link of a relay it is under: take it out */
     unlist(nodeId: string): Promise<void>;
 }
 
@@ -250,7 +253,7 @@ export interface AggregateNodeOptions extends AggregateOptions {
     readonly requireListed?: readonly NodeRole[];
     readonly reread?: MeshServerOptions['reread'];
     readonly certify?: MeshServerOptions['certify'];
-    /** Lists the relays linked here while they are; without it nothing is listed */
+    /** Lists the relays linked here and below them while they are; without it nothing is listed */
     readonly relays?: RelayListing;
 }
 
@@ -260,7 +263,7 @@ export interface AggregateNode {
     /** The aggregate itself, for a node in the same process */
     readonly aggregate: Aggregate;
     readonly mesh: MeshServer;
-    /** The relays linked here now, as they are listed */
+    /** The relays linked here and below them now, as they are listed, each after its parent */
     relays(): ListedRelay[];
     close(): Promise<void>;
 }
@@ -281,8 +284,10 @@ const noSubscriptions: Upstream = {
  */
 export async function startAggregateNode(options: AggregateNodeOptions): Promise<AggregateNode> {
     const aggregate = createAggregate(options.storage, { ...(options.mayPersist === undefined ? {} : { mayPersist: options.mayPersist }) });
-    /** Each linked relay with its count of open links: a relay that dials again may open a link before its old one closes */
-    const linked = new Map<string, { relay: ListedRelay; links: number }>();
+    /** Each relay linked here, with its count of open links: a relay that dials again may open a link before its old one closes */
+    const linked = new Map<string, number>();
+    /** Every listed relay under its parent: this aggregate for a relay linked here, the relay it is linked to for one below */
+    const tree = createRelayTree<ListedRelay>(options.nodeId);
     /** Each relay's listing and unlisting, in the order its links opened and closed */
     const pending = new Map<string, Promise<void>>();
     const inTurn = (id: string, step: () => Promise<void>, what: string): void => {
@@ -295,26 +300,49 @@ export async function startAggregateNode(options: AggregateNodeOptions): Promise
         });
     };
     const listing = options.relays;
-    const opened = (peer: NodeCertificateClaims): void => {
-        if (peer.role !== 'relay' || listing === undefined) return;
-        const known = linked.get(peer.nodeId);
-        if (known !== undefined) {
-            known.links += 1;
-            return;
-        }
-        const relay: ListedRelay = { id: peer.nodeId, region: peer.region, group: peer.group ?? '', endpoint: peer.endpoint ?? '', publicKey: peer.publicKey, parent: options.nodeId };
-        linked.set(peer.nodeId, { relay, links: 1 });
-        report(CATEGORY, 'Aggregate %s lists relay %s of group %s', [options.nodeId, relay.id, relay.group]);
+    const list = (claims: NodeCertificateClaims, parent: string): void => {
+        if (listing === undefined) return;
+        const relay: ListedRelay = { id: claims.nodeId, region: claims.region, group: claims.group ?? '', endpoint: claims.endpoint ?? '', publicKey: claims.publicKey, parent };
+        if (!tree.link(relay.id, parent, relay)) return;
+        report(CATEGORY, 'Aggregate %s lists relay %s of group %s under %s', [options.nodeId, relay.id, relay.group, parent]);
         inTurn(relay.id, () => listing.list(relay), 'list');
     };
-    const closed = (peer: NodeCertificateClaims): void => {
-        const known = peer.role === 'relay' && listing !== undefined ? linked.get(peer.nodeId) : undefined;
-        if (known === undefined || listing === undefined) return;
-        known.links -= 1;
-        if (known.links > 0) return;
+    /** Takes a relay out with every relay under it */
+    const unlist = (id: string): void => {
+        if (listing === undefined) return;
+        for (const gone of tree.unlink(id)) {
+            report(CATEGORY, 'Aggregate %s takes relay %s out of the directory', [options.nodeId, gone]);
+            inTurn(gone, () => listing.unlist(gone), 'unlist');
+        }
+    };
+    const opened = (peer: NodeCertificateClaims, link: OpenedLink): void => {
+        if (peer.role !== 'relay' || link.routing) return;
+        const links = (linked.get(peer.nodeId) ?? 0) + 1;
+        linked.set(peer.nodeId, links);
+        if (links === 1) list(peer, options.nodeId);
+    };
+    const closed = (peer: NodeCertificateClaims, link: OpenedLink): void => {
+        const links = peer.role !== 'relay' || link.routing ? undefined : linked.get(peer.nodeId);
+        if (links === undefined) return;
+        if (links > 1) return void linked.set(peer.nodeId, links - 1);
         linked.delete(peer.nodeId);
-        report(CATEGORY, 'Aggregate %s takes relay %s out of the directory', [options.nodeId, peer.nodeId]);
-        inTurn(peer.nodeId, () => listing.unlist(peer.nodeId), 'unlist');
+        unlist(peer.nodeId);
+    };
+    /**
+     * A relay below passed up a relay linked to it: listed under `via` when the aggregate checked its certificate itself
+     * and `via` is listed under the relay on this link (a relay vouches only for its own branch)
+     */
+    const relayLinked = (certificate: string, via: string, peer: NodeCertificateClaims): void => {
+        const checked = verifyNodeCertificate(certificate, options.authorityPublicKey, Date.now());
+        if (!checked.ok || checked.claims.role !== 'relay') {
+            report.warning('Aggregate %s lists no relay passed up by %s: %s', [options.nodeId, peer.nodeId, checked.ok ? 'it is not a relay' : checked.reason]);
+            return;
+        }
+        if (linked.has(checked.claims.nodeId) || tree.branchOf(via) !== peer.nodeId || tree.parentOf(checked.claims.nodeId) === via) return;
+        list(checked.claims, via);
+    };
+    const relayUnlinked = (id: string, via: string, peer: NodeCertificateClaims): void => {
+        if (tree.parentOf(id) === via && tree.branchOf(via) === peer.nodeId) unlist(id);
     };
     const mesh = await startMeshServer({
         nodeId: options.nodeId,
@@ -335,14 +363,16 @@ export async function startAggregateNode(options: AggregateNodeOptions): Promise
         ...(options.reread === undefined ? {} : { reread: options.reread }),
         ...(options.certify === undefined ? {} : { certify: options.certify }),
         onLinkOpened: opened,
-        onLinkClosed: closed
+        onLinkClosed: closed,
+        relayLinked,
+        relayUnlinked
     });
     return {
         nodeId: options.nodeId,
         url: mesh.url,
         aggregate,
         mesh,
-        relays: () => [...linked.values()].map((entry) => entry.relay),
+        relays: () => tree.walk().map((entry) => entry.value),
         close: async () => {
             await mesh.close();
             await Promise.all([...pending.values()]);

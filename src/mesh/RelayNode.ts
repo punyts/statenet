@@ -1,6 +1,7 @@
 import { report } from '@punyts/core';
 import { createRelay } from '@punyts/state-sync/authority';
 import type { Relay } from '@punyts/state-sync/authority';
+import { verifyNodeCertificate } from './certificates.js';
 import type { KeyPair } from './certificates.js';
 import { startClientServer } from './ClientServer.js';
 import type { ClientServer, ClientServerOptions } from './ClientServer.js';
@@ -103,7 +104,8 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
             certificate: () => upstream.certificate(),
             authorityPublicKey: options.authorityPublicKey,
             parents: [endpoint],
-            followDirectory: false
+            followDirectory: false,
+            routing: true
         });
         relays.set(under, { endpoint, link });
         return reachThrough(link, to);
@@ -114,6 +116,8 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         ...(options.leaseMs === undefined ? {} : { leaseMs: options.leaseMs }),
         ...(options.checkGrants === false ? {} : { grants: { keyOf: (kid) => directory.keys[kid] } })
     });
+    /** The relays linked here as children, with their count of open links (one may dial again before its old link closes) */
+    const children = new Map<string, number>();
     mesh = await startMeshServer({
         nodeId: options.nodeId,
         role: 'relay',
@@ -130,6 +134,25 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
         write: (address, change, access) => upstream.write(address, change, access),
         route,
         directory: () => directory,
+        // the relays below are passed up, so the aggregate lists every relay of the tree (docs/design/statenet-relay-chains.md)
+        onLinkOpened: (peer, link) => {
+            if (peer.role !== 'relay' || link.routing) return;
+            const links = (children.get(peer.nodeId) ?? 0) + 1;
+            children.set(peer.nodeId, links);
+            if (links === 1) upstream.relayLinked(peer.nodeId, link.certificate, options.nodeId);
+        },
+        onLinkClosed: (peer, link) => {
+            const links = peer.role !== 'relay' || link.routing ? undefined : children.get(peer.nodeId);
+            if (links === undefined) return;
+            if (links > 1) return void children.set(peer.nodeId, links - 1);
+            children.delete(peer.nodeId);
+            upstream.relayUnlinked(peer.nodeId, options.nodeId);
+        },
+        relayLinked: (certificate, via) => {
+            const checked = verifyNodeCertificate(certificate, options.authorityPublicKey, Date.now());
+            if (checked.ok && checked.claims.role === 'relay') upstream.relayLinked(checked.claims.nodeId, certificate, via);
+        },
+        relayUnlinked: (id, via) => upstream.relayUnlinked(id, via),
         ...(options.host === undefined ? {} : { host: options.host }),
         port: options.meshPort ?? 0
     });

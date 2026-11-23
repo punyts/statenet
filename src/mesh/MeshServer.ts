@@ -61,10 +61,20 @@ export interface MeshServerOptions {
     readonly route?: ServingOptions['route'];
     /** The directory the nodes below learn; read when a link opens */
     readonly directory: () => DirectoryView;
-    /** Called when a node's link has opened (after its proof), with what its certificate says */
-    readonly onLinkOpened?: (peer: NodeCertificateClaims) => void;
+    /**
+     * Called when a node's link has opened (after its proof), with what its certificate says, the certificate, and
+     * whether a relay opened it to reach the nodes below this one rather than as its child (`routing`)
+     */
+    readonly onLinkOpened?: (peer: NodeCertificateClaims, link: OpenedLink) => void;
     /** Called when a link that opened has closed */
-    readonly onLinkClosed?: (peer: NodeCertificateClaims) => void;
+    readonly onLinkClosed?: (peer: NodeCertificateClaims, link: OpenedLink) => void;
+    /**
+     * A relay linked below passes up a relay linked below it, or that relay's last link closing
+     * (docs/design/statenet-relay-chains.md): `via` is the relay it is linked to, `peer` the relay on this link.
+     * Only a child relay's link carries them
+     */
+    readonly relayLinked?: (certificate: string, via: string, peer: NodeCertificateClaims) => void;
+    readonly relayUnlinked?: (id: string, via: string, peer: NodeCertificateClaims) => void;
     /**
      * The sessions of a namespace this node owns, for a peer that serves a view of it (an owner node of the same
      * statenet): the endpoint, or why not (it is owned elsewhere now). Without it a peer cannot open sessions here
@@ -84,9 +94,17 @@ export interface MeshServerOptions {
     readonly now?: () => number;
 }
 
+/** What a link was opened with, past what its certificate says */
+export interface OpenedLink {
+    readonly certificate: string;
+    /** A relay opened it to reach the nodes below this node, not as its child */
+    readonly routing: boolean;
+}
+
 interface Link {
     readonly socket: WebSocket;
     readonly peer: NodeCertificateClaims;
+    readonly opened: OpenedLink;
     /** What seals every message of the link after its handshake */
     readonly seal: LinkSeal;
     /** What this node does with the asks of the node below */
@@ -162,6 +180,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
         let greeted = false;
         let seal: LinkSeal | undefined;
         let facts: Parameters<typeof transcript>[2] | undefined;
+        let hello: OpenedLink | undefined;
         let link: Link | undefined;
         const refuse = (reason: string): void => {
             report.warning('Node %s refused a link from %s: %s', [options.nodeId, peer?.nodeId ?? 'a node', reason]);
@@ -181,6 +200,12 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                     // `rev` answers what this node asked of the node below; the rest are the node's own asks
                     for (const each of sealed.messages) {
                         if (each.type === 'rev') link.client.receive(each.message);
+                        else if (each.type === 'relay-linked' || each.type === 'relay-unlinked') {
+                            // only a relay's child relay tells it of the relays below
+                            if (link.peer.role !== 'relay' || link.opened.routing || typeof each.via !== 'string') continue;
+                            if (each.type === 'relay-linked' && typeof each.certificate === 'string') options.relayLinked?.(each.certificate, each.via, link.peer);
+                            else if (each.type === 'relay-unlinked' && typeof each.id === 'string') options.relayUnlinked?.(each.id, each.via, link.peer);
+                        }
                         else void link.serving.receive(each);
                     }
                 } else if (sealed.type === 'ping') sendSealed(link, { type: 'pong' });
@@ -205,6 +230,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                 const welcome = (): void => {
                     peer = claims;
                     seal = sealed;
+                    hello = { certificate: message.certificate, routing: message.routing === true && claims.role === 'relay' };
                     facts = { diallerShare: message.share, serverShare: mine.share, dialler: claims.nodeId, server: options.nodeId };
                     send(socket, { type: 'link-welcome', nodeId: options.nodeId, certificate: certificate(), nonce, proof: proveNode(transcript('server', message.nonce, facts), options.keys.privateKey), share: mine.share });
                 };
@@ -217,7 +243,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                     .then(() => (listed(claims) ? welcome() : refuse('the node is not in the directory')));
                 return;
             }
-            if (message.type === 'link-proof' && peer !== undefined && seal !== undefined && facts !== undefined) {
+            if (message.type === 'link-proof' && peer !== undefined && seal !== undefined && facts !== undefined && hello !== undefined) {
                 if (!checkProof(transcript('dialler', nonce, facts), message.proof, peer.publicKey)) return refuse('the node did not prove it holds its key');
                 clearTimeout(timeout);
                 // the first sealed frame starts with the directory: the node below knows by it that it was let in
@@ -229,6 +255,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                 const opened: Link = {
                     socket,
                     peer,
+                    opened: hello,
                     seal,
                     serving: createServing(options, peer, ask, () => link !== undefined && links.has(link)),
                     client: createLinkClient((message) => ask({ type: 'rev', message })),
@@ -240,7 +267,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
                 report(CATEGORY, 'Node %s opened a link from %s (%s): %s links', [options.nodeId, opened.peer.nodeId, opened.peer.role, links.size]);
                 opened.scheduled = true;
                 queueMicrotask(() => flush(opened));
-                options.onLinkOpened?.(opened.peer);
+                options.onLinkOpened?.(opened.peer, opened.opened);
                 return;
             }
             refuse('open the link with link-hello and link-proof first');
@@ -252,7 +279,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
             report(CATEGORY, 'The link from %s to node %s closed: %s links', [link.peer.nodeId, options.nodeId, links.size]);
             link.serving.close();
             link.client.close();
-            options.onLinkClosed?.(link.peer);
+            options.onLinkClosed?.(link.peer, link.opened);
         });
         socket.on('error', () => undefined);
     });

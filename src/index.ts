@@ -9,7 +9,7 @@ export type { KeyPair, NodeCertificateClaims, NodeRole } from "./mesh/certificat
 export { MESH_PROTOCOL, parseLinkMessage } from "./mesh/protocol.js";
 export type { DirectoryView, LinkMessage, MeshFrame, MeshMessage } from "./mesh/protocol.js";
 export { startMeshServer } from "./mesh/MeshServer.js";
-export type { MeshServer, MeshServerOptions, MeshServerStats, MeshWriter, SessionEndpoint } from "./mesh/MeshServer.js";
+export type { MeshServer, MeshServerOptions, MeshServerStats, MeshWriter, OpenedLink, SessionEndpoint } from "./mesh/MeshServer.js";
 export { createMeshUpstream, reachThrough } from "./mesh/MeshUpstream.js";
 export { createLinkClient } from "./mesh/linkClient.js";
 export type { LinkClient } from "./mesh/linkClient.js";

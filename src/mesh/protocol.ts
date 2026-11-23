@@ -3,7 +3,7 @@ import type { Access, GrantKey, RelayBatch, RelayWelcome, StoredNamespace, Write
 import type { NodeRole } from './certificates.js';
 
 /** The version of the mesh protocol, named in `link-hello` */
-export const MESH_PROTOCOL = 2;
+export const MESH_PROTOCOL = 3;
 
 /**
  * What a parent tells a node below it about the statenet (docs/design/statenet-relays.md, "The directory"), so a relay
@@ -30,7 +30,8 @@ export type LoadOutcome = { ok: true; stored?: StoredNamespace } | { ok: false; 
  * both shares (`transcript`). These go in the clear; everything after `link-proof` is sealed (`sealOf`), and the
  * first sealed frame, from the server, starts with the directory
  */
-export type LinkHello = { type: 'link-hello'; nodeId: string; role: NodeRole; protocol: number; region: string; certificate: string; nonce: string; share: string };
+/** `routing`: a relay opens the link to reach the nodes below the other end, not as its child (docs/design/statenet-relay-chains.md) */
+export type LinkHello = { type: 'link-hello'; nodeId: string; role: NodeRole; protocol: number; region: string; certificate: string; nonce: string; share: string; routing?: boolean };
 export type LinkWelcome = { type: 'link-welcome'; nodeId: string; certificate: string; nonce: string; proof: string; share: string };
 export type LinkProof = { type: 'link-proof'; proof: string };
 export type LinkRefused = { type: 'link-refused'; reason: string };
@@ -85,7 +86,14 @@ export type MeshMessage =
     | { type: 'handed'; cid: number; qid: number; outcome: WriteOutcome }
     /** The owner asks the node at the other end to claim a namespace (it sends most of the writes), and hears whether it did */
     | { type: 'take'; cid: number; address: string; to?: string }
-    | { type: 'taken'; cid: number; ok: boolean };
+    | { type: 'taken'; cid: number; ok: boolean }
+    /**
+     * A relay linked below a relay, passed up link by link to the aggregate (docs/design/statenet-relay-chains.md):
+     * `via` is the relay it is linked to, `certificate` the one it proved there. No answer
+     */
+    | { type: 'relay-linked'; certificate: string; via: string }
+    /** The last link of relay `id` to relay `via` closed: it and every relay under it are unlisted */
+    | { type: 'relay-unlinked'; id: string; via: string };
 
 /** Many messages from one moment, of many namespaces, in one WebSocket message */
 export type MeshFrame = { type: 'frame'; messages: MeshMessage[] };

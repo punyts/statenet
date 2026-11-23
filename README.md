@@ -102,7 +102,9 @@ serves its namespaces down, and relays cache what is subscribed through them and
   other directly, and what is for a node of another group goes through the relays, which find it by the directory:
   the node's `parent` (the relay its link reached, `onUplinked`) and that relay's `endpoint`. An aggregate with
   `relays` (`RelayListing`) lists each relay linked to it from its certificate (`endpoint` and `group` are claims) while
-  its link is up, so the directory needs no row written by hand (`docs/design/statenet-relay-directory.md`).
+  its link is up, so the directory needs no row written by hand (`docs/design/statenet-relay-directory.md`). A relay
+  passes up the relays linked below it, and the aggregate lists each under the relay it is linked to, so a relay
+  under a relay is routed to as any other (`docs/design/statenet-relay-chains.md`).
 - An aggregate is the only writer of state: `startAggregateNode` (or `createAggregate` in the node's own process) saves
   what nodes send it, and `createAggregateStorage` is the storage a node uses to save through one. With no database,
   `createFileEpochStorage` keeps the namespaces in files.
