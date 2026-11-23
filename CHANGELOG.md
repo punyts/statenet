@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **A revocation names the permission entry** (docs/design/statenet-permissions.md, S14a). Breaking: the mesh message is `{ type: 'revoked', entry, expires }`. Test: `src/mesh/mesh.test.ts`.
 - **An aggregate lists the relays linked to it** (docs/design/statenet-relay-directory.md, S13). `AggregateNodeOptions.relays` (`RelayListing`: `list`, `unlist`) is told of a relay when its first link opens and when its last one closes, as a `ListedRelay` whose id, region, group, endpoint and key come from its certificate and whose parent is the aggregate; `AggregateNode.relays()` lists those linked now. `NodeCertificateClaims.endpoint` is where other relays reach a relay, and a renewal keeps it with the group. `MeshServerOptions.onLinkOpened` and `onLinkClosed` hear links open and close; `MeshUpstreamOptions.onLinked` and `OwnerMeshOptions.onUplinked` tell a node which relay its link reached, to list as its parent. Tests: `src/mesh/aggregate.test.ts` ("an aggregate that lists its relays"), `src/mesh/network.test.ts` ("should keep the group and endpoint of a relay in its renewed certificate"), `src/mesh/groups.test.ts` ("should carry a write to a node of another group with a directory the aggregate and the nodes wrote themselves").
 
 - **A browser's rejected ack carries the rejection code.** The client server passes `WriteOutcome.code` on in the `ack` it sends, so the browser learns that a node with no link refused a change as `unsaved`. Needs state-sync's `RejectionCode`. Tests: `src/mesh/*.test.ts` (unchanged, passing).

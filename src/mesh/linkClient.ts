@@ -146,7 +146,7 @@ export function createLinkClient(push: (message: MeshMessage) => void, options: 
                     return;
                 }
                 case 'revoked':
-                    for (const want of wanted.values()) want.listener.revoked?.(message.grantId, message.expires);
+                    for (const want of wanted.values()) want.listener.revoked?.(message.entry, message.expires);
                     return;
                 case 'written': {
                     const done = writes.get(message.wid);

@@ -52,7 +52,7 @@ export type MeshMessage =
     | { type: 'closed'; sid: number; reason: string }
     /** The parent dropped what it held back for a slow subscription: subscribe again from your revision */
     | { type: 'resync'; sid: number }
-    | { type: 'revoked'; grantId: string; expires: number }
+    | { type: 'revoked'; entry: string; expires: number }
     | { type: 'write'; wid: number; address: string; change: Change; access?: Access; to?: string; from?: string }
     | { type: 'written'; wid: number; outcome: WriteOutcome }
     | { type: 'credit'; amount: number }

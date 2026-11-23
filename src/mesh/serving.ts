@@ -182,7 +182,7 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                             subscriptions.delete(sid);
                             push({ type: 'closed', sid, reason });
                         },
-                        revoked: (grantId, expires) => push({ type: 'revoked', grantId, expires })
+                        revoked: (entry, expires) => push({ type: 'revoked', entry, expires })
                     },
                     access
                 );

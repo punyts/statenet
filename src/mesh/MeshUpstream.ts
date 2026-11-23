@@ -314,7 +314,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 return;
             }
             case 'revoked':
-                for (const want of wanted.values()) want.listener.revoked?.(message.grantId, message.expires);
+                for (const want of wanted.values()) want.listener.revoked?.(message.entry, message.expires);
                 return;
             case 'written': {
                 const write = writes.get(message.wid);

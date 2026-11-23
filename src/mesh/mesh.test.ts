@@ -243,7 +243,7 @@ describe('the mesh', () => {
         await owner.write(ADDRESS, change('$.data.n', 1));
         const edge = await relayNode('relay-edge', [await startOwnerUrl(owner, directory)], { checkGrants: true });
         await vi.waitFor(() => expect(edge.upstream.directory()).toBeDefined());
-        const grant = signGrant({ kid: 'alice-1', issuer: 'alice', subject: 'bob', address: ADDRESS, prefix: '$.data', rights: ['read'], issued: Date.now(), expires: Date.now() + HOUR }, alice.privateKey);
+        const grant = signGrant({ kid: 'alice-1', issuer: 'alice', subject: 'bob', owner: 'alice', pattern: '$.notes.user.data', rights: ['read'], issued: Date.now(), expires: Date.now() + HOUR }, alice.privateKey);
         const bob = follower('$.data');
         const carol = { ...follower('$.data'), closed: '' };
 

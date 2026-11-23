@@ -171,7 +171,7 @@ export function createPlacedUpstream(options: PlacedUpstreamOptions): Upstream {
                     listener.changes(batch);
                 },
                 durable: (to) => listener.durable?.(to),
-                revoked: (grantId, expires) => listener.revoked?.(grantId, expires),
+                revoked: (entry, expires) => listener.revoked?.(entry, expires),
                 closed: (reason) => {
                     current = undefined;
                     if (closed) return;
