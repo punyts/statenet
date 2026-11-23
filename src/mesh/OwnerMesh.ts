@@ -103,14 +103,14 @@ export function createPeerLinks(options: PeerLinksOptions): PeerLinks {
             const upstream = link(nodeId);
             if (upstream === undefined) return undefined;
             return {
-                write: (address: string, change: Change) =>
+                write: (address: string, change: Change, _via?: string, access?: Access) =>
                     new Promise<WriteOutcome>((resolve) => {
                         const timer = setTimeout(() => {
                             report.warning('Node %s did not answer a write of %s in %s ms', [nodeId, address, writeTimeoutMs]);
                             resolve({ result: 'rejected', reason: `node ${nodeId} did not answer` });
                         }, writeTimeoutMs);
                         (timer as { unref?: () => void }).unref?.();
-                        void upstream.write(address, change).then((outcome) => {
+                        void upstream.write(address, change, access).then((outcome) => {
                             clearTimeout(timer);
                             resolve(outcome);
                         });
@@ -328,7 +328,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
                   ...(options.onUplinked === undefined ? {} : { onLinked: options.onUplinked }),
                   serve: {
                       upstream: relay,
-                      write: (address, change, _access, via) => node.write(address, change, via),
+                      write: (address, change, access, via) => node.write(address, change, via, access),
                       sessions,
                       handoff: (address, to) => node.handoff(address, to),
                       take: (address) => node.claim(address)
@@ -342,7 +342,7 @@ export async function startOwnerMesh(options: OwnerMeshOptions): Promise<OwnerMe
         certificate: options.certificate,
         authorityPublicKey: options.authorityPublicKey,
         upstream: relay,
-        write: (address, change, _access, via) => node.write(address, change, via),
+        write: (address, change, access, via) => node.write(address, change, via, access),
         directory: options.directory,
         sessions: async (address) => {
             const authority = node.owns(address) ? await node.authorityOf(address) : undefined;

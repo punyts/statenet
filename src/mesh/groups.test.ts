@@ -2,8 +2,8 @@ import { createServer } from 'node:net';
 import { createStore } from '@punyts/state';
 import { createStoreBridge, createSyncClient } from '@punyts/state-sync';
 import type { Change, JsonValue, SyncTransport } from '@punyts/state-sync';
-import { createAuthority, createMemoryEpochStorage, createMemoryOwnershipStore } from '@punyts/state-sync/authority';
-import type { Authority, AuthoritySession, EpochStorage, NamespaceHost, OwnershipStore, RelayListener } from '@punyts/state-sync/authority';
+import { createAuthority, createMemoryEpochStorage, createMemoryOwnershipStore, generateGrantKey, signGrant } from '@punyts/state-sync/authority';
+import type { Authority, AuthoritySession, EpochStorage, GrantContext, NamespaceHost, OwnershipStore, RelayListener } from '@punyts/state-sync/authority';
 import { addListener, removeListener, setCategories } from '@punyts/core';
 import type { ListenerFn } from '@punyts/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -44,15 +44,15 @@ const freePort = (): Promise<number> =>
         });
     });
 
-/** A node's authorities over a storage: one shared by the servers, or each node's way to the aggregate */
-function hostOver(storageOf: () => EpochStorage) {
+/** A node's authorities over a storage: one shared by the servers, or each node's way to the aggregate; `access` checks writes */
+function hostOver(storageOf: () => EpochStorage, access?: (address: string) => GrantContext) {
     const running = new Map<string, Promise<Authority>>();
     const host: NamespaceHost = {
         authority: (address, epoch) => {
             let found = running.get(address);
             if (found === undefined) {
                 const storage = storageOf();
-                found = createAuthority({ namespace: NAMESPACE, storage: { load: () => storage.load(address), save: (_namespace, stored) => storage.save(address, stored, epoch) }, initial: { data: {} }, createParents: true });
+                found = createAuthority({ namespace: NAMESPACE, storage: { load: () => storage.load(address), save: (_namespace, stored) => storage.save(address, stored, epoch) }, initial: { data: {} }, createParents: true, ...(access === undefined ? {} : { access: { address, context: () => access(address) } }) });
                 running.set(address, found);
             }
             return found;
@@ -77,9 +77,10 @@ interface Placed {
  * link to each other. `throughAggregate` has the nodes save through their relay to the aggregate; otherwise they share
  * a storage, as servers on one database do. `selfListed` writes no row by hand: the aggregate lists the relays linked to
  * it from their certificates, which name their endpoints, and each node lists the relay its link reached as its parent.
- * `under` links a relay to another relay instead of the aggregate (relays under relays; the parent is placed first)
+ * `under` links a relay to another relay instead of the aggregate (relays under relays; the parent is placed first).
+ * `access` has every node's authorities check writes against the access they came with
  */
-async function statenet(placed: readonly Placed[], throughAggregate = false, selfListed = false, under: Readonly<Record<string, string>> = {}) {
+async function statenet(placed: readonly Placed[], throughAggregate = false, selfListed = false, under: Readonly<Record<string, string>> = {}, access?: (address: string) => GrantContext) {
     const ownership: OwnershipStore = createMemoryOwnershipStore();
     const database = createMemoryEpochStorage();
     const entries: Array<DirectoryView['nodes'][number]> = [];
@@ -114,7 +115,7 @@ async function statenet(placed: readonly Placed[], throughAggregate = false, sel
     for (const { id, group, relay } of placed) {
         const keys = generateKeyPair();
         let mesh: OwnerMesh | undefined;
-        const host = hostOver(() => (throughAggregate && mesh?.uplink !== undefined ? createAggregateStorage(mesh.uplink) : database));
+        const host = hostOver(() => (throughAggregate && mesh?.uplink !== undefined ? createAggregateStorage(mesh.uplink) : database), access);
         mesh = await startOwnerMesh({
             nodeId: id,
             group,
@@ -447,5 +448,31 @@ describe('relays under relays', () => {
 
         // Assert
         expect(aggregate().relays().map((relay) => relay.id)).toEqual(['relay-a', 'relay-b']);
+    });
+});
+
+describe('requests across groups', () => {
+    it('should keep a write from a node of another group as a request when its sender may only request, until the owner approves it', async () => {
+        // Arrange
+        const alice = generateGrantKey();
+        const now = Date.now();
+        const context = (): GrantContext => ({ keyOf: (kid) => (kid === 'alice-1' ? { ownerId: 'alice', publicKey: alice.publicKey } : undefined), now: Date.now() });
+        const { nodes } = await statenet(TWO_GROUPS, false, false, {}, context);
+        const grant = signGrant({ kid: 'alice-1', issuer: 'alice', subject: 'bob', owner: 'alice', pattern: '$.notes.user.data', rights: ['request'], issued: now, expires: now + HOUR }, alice.privateKey);
+        await nodes('a1').node.write(ADDRESS, change('$.data.title', 'Mine'), 'a1', { subject: 'alice' });
+        const asked = change('$.data.title', 'Suggested');
+
+        // Act
+        const outcome = await nodes('b1').node.write(ADDRESS, asked, 'b1', { subject: 'bob', grant });
+        const authority = (await nodes('a1').node.authorityOf(ADDRESS)) as Authority;
+        const before = authority.get('$.data.title');
+        const decided = authority.decide({ id: asked.id, action: 'approve' }, { subject: 'alice' });
+
+        // Assert
+        expect(outcome).toEqual({ result: 'requested', epoch: 1 });
+        expect(before).toBe('Mine');
+        expect(decided).toEqual({ ok: true, status: 'approved' });
+        expect(authority.get('$.data.title')).toBe('Suggested');
+        expect(authority.requests()).toMatchObject([{ by: 'bob', status: 'approved', decidedBy: 'alice' }]);
     });
 });

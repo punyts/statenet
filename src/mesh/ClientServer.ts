@@ -112,9 +112,11 @@ export async function startClientServer(options: ClientServerOptions): Promise<C
                     send(
                         outcome.result === 'rejected'
                             ? { type: 'ack', id: change.id, result: 'rejected', reason: outcome.reason, ...(outcome.code === undefined ? {} : { code: outcome.code }) }
-                            : outcome.result === 'adjusted'
-                              ? { type: 'ack', id: change.id, result: 'adjusted', revision: outcome.revision, value: outcome.value ?? null }
-                              : { type: 'ack', id: change.id, result: 'applied', revision: outcome.revision }
+                            : outcome.result === 'requested'
+                              ? { type: 'ack', id: change.id, result: 'requested' }
+                              : outcome.result === 'adjusted'
+                                ? { type: 'ack', id: change.id, result: 'adjusted', revision: outcome.revision, value: outcome.value ?? null }
+                                : { type: 'ack', id: change.id, result: 'applied', revision: outcome.revision }
                     );
                 });
             }

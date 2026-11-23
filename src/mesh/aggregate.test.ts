@@ -125,6 +125,27 @@ describe('the aggregate', () => {
         expect((await (storages[1] as EpochStorage).load(ADDRESS))?.state).toEqual({ n: 'six' });
     });
 
+    it('should write a save that takes no revision ($.server, a request) by its serial, through the aggregate, in memory and in files', async () => {
+        // Arrange
+        const dataDir = await mkdtemp(join(tmpdir(), 'statenet-aggregate-'));
+        closers.push(() => rm(dataDir, { recursive: true, force: true }));
+        const storages = [createMemoryEpochStorage(), createFileEpochStorage({ dataDir })];
+        const serialed = (serial: number, n: string): StoredNamespace => ({ ...stored(5, { n }), serial });
+
+        // Act
+        for (const storage of storages) {
+            const aggregate = createAggregate(storage);
+            await aggregate.persist(ADDRESS, serialed(5, 'five'), 2);
+            await aggregate.persist(ADDRESS, serialed(6, 'a request'), 2);
+            await aggregate.persist(ADDRESS, serialed(6, 'sent again'), 2);
+            await createAggregate(storage).persist(ADDRESS, serialed(6, 'after a restart'), 2);
+        }
+
+        // Assert
+        const states = await Promise.all(storages.map(async (storage) => (await storage.load(ADDRESS))?.state));
+        expect(states).toEqual([{ n: 'a request' }, { n: 'a request' }]);
+    });
+
     it('should fold the saves that arrive while one runs into one batch, and answer each when it lands', async () => {
         // Arrange
         const { storage, saved, hold, release } = gatedStorage();

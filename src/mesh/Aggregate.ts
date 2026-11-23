@@ -1,5 +1,5 @@
 import { report } from '@punyts/core';
-import { FencedError } from '@punyts/state-sync/authority';
+import { FencedError, isResave, serialOf } from '@punyts/state-sync/authority';
 import type { EpochStorage, StoredNamespace, Upstream } from '@punyts/state-sync/authority';
 import { verifyNodeCertificate } from './certificates.js';
 import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
@@ -54,7 +54,7 @@ interface Waiter {
 
 interface Lane {
     /** The newest save that landed, as far as this aggregate saw */
-    head?: { revision: number; epoch: number };
+    head?: { revision: number; serial: number; epoch: number };
     /** The save that goes next, with everyone waiting on it: a later save of the namespace replaces it */
     next?: { stored: StoredNamespace; epoch: number; waiters: Waiter[] };
     running: boolean;
@@ -66,7 +66,8 @@ interface Lane {
  * The only writer of state (docs/design/statenet-network.md, "Aggregates write to the database"): nodes send it their
  * namespaces to save, and its answer is what makes a change durable. The saves of a namespace run one at a time; those
  * that arrive while one runs are folded into one batch, the newest, and every node waiting on an earlier revision is
- * answered when it lands. A save at or below the revision that already landed under its epoch writes nothing (a resend
+ * answered when it lands. A save that already landed under its epoch (`isResave`: at or below its revision and serial,
+ * which counts what takes no revision, such as $.server writes and requests) writes nothing (a resend
  * after a dropped link); a save under an older epoch is answered `fenced` and writes nothing, by this aggregate's own
  * count or by the storage's, which is the one that holds across aggregates
  */
@@ -89,7 +90,7 @@ export function createAggregate(storage: AggregateStorageBackend, options: Aggre
                 delete lane.next;
                 let outcome: PersistOutcome;
                 const landed = lane.head;
-                if (landed !== undefined && batch.epoch === landed.epoch && batch.stored.revision <= landed.revision) {
+                if (landed !== undefined && batch.epoch === landed.epoch && isResave(batch.stored, landed)) {
                     // sent again while the first was being saved (its link dropped): it has landed by now
                     folded += batch.waiters.length;
                     report(CATEGORY, 'Folded %s saves of %s: revision %s has landed', [batch.waiters.length, address, landed.revision]);
@@ -101,11 +102,11 @@ export function createAggregate(storage: AggregateStorageBackend, options: Aggre
                     await storage.save(address, batch.stored, batch.epoch);
                     saves++;
                     report(CATEGORY, 'Saved %s at revision %s under epoch %s in %s ms, for %s waiting', [address, batch.stored.revision, batch.epoch, Math.round((performance.now() - start) * 10) / 10, batch.waiters.length]);
-                    lane.head = { revision: batch.stored.revision, epoch: batch.epoch };
+                    lane.head = { revision: batch.stored.revision, serial: serialOf(batch.stored), epoch: batch.epoch };
                     outcome = { result: 'saved', revision: batch.stored.revision };
                 } catch (error) {
                     if (error instanceof FencedError) {
-                        lane.head = { revision: lane.head?.revision ?? 0, epoch: Math.max(error.current, lane.head?.epoch ?? 0) };
+                        lane.head = { revision: lane.head?.revision ?? 0, serial: lane.head?.serial ?? 0, epoch: Math.max(error.current, lane.head?.epoch ?? 0) };
                         report(CATEGORY, 'Fenced a save of %s under epoch %s: the storage has epoch %s', [address, batch.epoch, error.current]);
                         outcome = fence(batch.epoch, error.current);
                     } else {
@@ -135,7 +136,7 @@ export function createAggregate(storage: AggregateStorageBackend, options: Aggre
                 report(CATEGORY, 'Fenced a save of %s under epoch %s: it has epoch %s', [address, epoch, head.epoch]);
                 return fence(epoch, head.epoch);
             }
-            if (head !== undefined && epoch === head.epoch && stored.revision <= head.revision) {
+            if (head !== undefined && epoch === head.epoch && isResave(stored, head)) {
                 folded++;
                 return { result: 'saved', revision: head.revision };
             }
@@ -150,7 +151,7 @@ export function createAggregate(storage: AggregateStorageBackend, options: Aggre
                     for (const old of next.waiters) old.done(fence(old.epoch, epoch));
                     held.next = { stored, epoch, waiters: [waiter] };
                 } else {
-                    if (stored.revision >= next.stored.revision) next.stored = stored;
+                    if (isResave(next.stored, stored)) next.stored = stored;
                     next.waiters.push(waiter);
                 }
                 held.work = run(address, held);
@@ -168,13 +169,13 @@ export function createAggregate(storage: AggregateStorageBackend, options: Aggre
                 await storage.remove(address, epoch);
             } catch (error) {
                 if (error instanceof FencedError) {
-                    lane.head = { revision: lane.head?.revision ?? 0, epoch: Math.max(error.current, lane.head?.epoch ?? 0) };
+                    lane.head = { revision: lane.head?.revision ?? 0, serial: lane.head?.serial ?? 0, epoch: Math.max(error.current, lane.head?.epoch ?? 0) };
                     return fence(epoch, error.current) as RemoveOutcome;
                 }
                 return { result: 'failed', reason: error instanceof Error ? error.message : String(error) };
             }
             // what landed is gone, and a save from before the removal's epoch stays refused
-            lane.head = { revision: 0, epoch: Math.max(epoch, lane.head?.epoch ?? 0) };
+            lane.head = { revision: 0, serial: 0, epoch: Math.max(epoch, lane.head?.epoch ?? 0) };
             return { result: 'removed' };
         },
         load: async (address) => {

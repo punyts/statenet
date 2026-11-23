@@ -382,7 +382,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                         : {
                               revision: message.handoff.revision,
                               epoch: message.handoff.epoch,
-                              queued: message.handoff.queued.map(({ qid, change }) => ({ change, done: (outcome: WriteOutcome) => queue({ type: 'handed', cid, qid, outcome }) }))
+                              queued: message.handoff.queued.map(({ qid, change, access }) => ({ change, ...(access === undefined ? {} : { access }), done: (outcome: WriteOutcome) => queue({ type: 'handed', cid, qid, outcome }) }))
                           }
                 );
                 return;

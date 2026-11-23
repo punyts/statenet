@@ -262,7 +262,7 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                 }
                 const queued = handoff.queued.map((item, qid) => {
                     handed.set(`${message.cid}/${qid}`, item.done);
-                    return { qid, change: item.change };
+                    return { qid, change: item.change, ...(item.access === undefined ? {} : { access: item.access }) };
                 });
                 report(CATEGORY, 'Node %s passed the handoff of %s to %s at revision %s', [options.nodeId, message.address, peer.nodeId, handoff.revision]);
                 push({ type: 'handoff', cid: message.cid, handoff: { revision: handoff.revision, epoch: handoff.epoch, queued } });

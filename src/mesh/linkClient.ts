@@ -173,7 +173,7 @@ export function createLinkClient(push: (message: MeshMessage) => void, options: 
                             : {
                                   revision: message.handoff.revision,
                                   epoch: message.handoff.epoch,
-                                  queued: message.handoff.queued.map(({ qid, change }) => ({ change, done: (outcome: WriteOutcome) => push({ type: 'handed', cid, qid, outcome }) }))
+                                  queued: message.handoff.queued.map(({ qid, change, access }) => ({ change, ...(access === undefined ? {} : { access }), done: (outcome: WriteOutcome) => push({ type: 'handed', cid, qid, outcome }) }))
                               }
                     );
                     return;

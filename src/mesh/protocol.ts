@@ -3,7 +3,7 @@ import type { Access, GrantKey, RelayBatch, RelayWelcome, StoredNamespace, Write
 import type { NodeRole } from './certificates.js';
 
 /** The version of the mesh protocol, named in `link-hello` */
-export const MESH_PROTOCOL = 3;
+export const MESH_PROTOCOL = 4;
 
 /**
  * What a parent tells a node below it about the statenet (docs/design/statenet-relays.md, "The directory"), so a relay
@@ -81,7 +81,7 @@ export type MeshMessage =
     | { type: 'shut'; tid: number; reason: string }
     /** A claim (docs/design/statenet-relays.md, "Ownership moves by a claim"): the owner answers with its handoff, or none */
     | { type: 'claim'; cid: number; address: string; to?: string; from?: string }
-    | { type: 'handoff'; cid: number; handoff?: { revision: number; epoch: number; queued: Array<{ qid: number; change: Change }> } }
+    | { type: 'handoff'; cid: number; handoff?: { revision: number; epoch: number; queued: Array<{ qid: number; change: Change; access?: Access }> } }
     /** The claimant's outcome of a write that was queued in the handoff, for the node that is waiting on it */
     | { type: 'handed'; cid: number; qid: number; outcome: WriteOutcome }
     /** The owner asks the node at the other end to claim a namespace (it sends most of the writes), and hears whether it did */
