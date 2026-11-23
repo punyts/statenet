@@ -107,7 +107,9 @@ serves its namespaces down, and relays cache what is subscribed through them and
   under a relay is routed to as any other (`docs/design/statenet-relay-chains.md`).
 - A write goes to the namespace's owner node with the writer's access, so the owner's authority can check it; one from
   someone who may only request the path comes back `requested` and waits there for a decision
-  (`docs/design/statenet-requests.md`). A decider anywhere decides over a session tunnelled to the owner.
+  (`docs/design/statenet-requests.md`). A decider anywhere decides over a session tunnelled to the owner. A relay's
+  browsers on protocol 3 get their requests from a requests-only session tunnelled to the owner, in their welcome and
+  as they are made and decided, and decide through it.
 - An aggregate is the only writer of state: `startAggregateNode` (or `createAggregate` in the node's own process) saves
   what nodes send it, and `createAggregateStorage` is the storage a node uses to save through one. With no database,
   `createFileEpochStorage` keeps the namespaces in files.

@@ -19,7 +19,7 @@ import type { RelayNode } from './RelayNode.js';
 
 const HOUR = 3_600_000;
 const ADDRESS = 'alice/notes/user';
-const NAMESPACE = 'alice_notes_user';
+const NAMESPACE = 'alice.notes.user';
 const ca = generateKeyPair();
 const closers: Array<() => Promise<void> | void> = [];
 

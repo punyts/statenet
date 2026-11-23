@@ -159,7 +159,7 @@ export async function startRelayNode(options: RelayNodeOptions): Promise<RelayNo
     const clients: ClientServer | undefined =
         options.clientPort === undefined
             ? undefined
-            : await startClientServer({ upstream: relay, write: (address, change, access) => upstream.write(address, change, access), ...(options.accessOf === undefined ? {} : { accessOf: options.accessOf }), ...(options.host === undefined ? {} : { host: options.host }), port: options.clientPort });
+            : await startClientServer({ upstream: relay, write: (address, change, access) => upstream.write(address, change, access), open: (address, connection, access) => upstream.open(address, connection, access), ...(options.accessOf === undefined ? {} : { accessOf: options.accessOf }), ...(options.host === undefined ? {} : { host: options.host }), port: options.clientPort });
     const server = mesh;
     report(CATEGORY, 'Relay %s started: links at %s, browsers at %s', [options.nodeId, server.url, clients?.url ?? '(none)']);
     return {
