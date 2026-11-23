@@ -102,6 +102,29 @@ describe('the aggregate', () => {
         expect(aggregate.stats()).toMatchObject({ saves: 1, folded: 2 });
     });
 
+    it('should write nothing for a save sent again after the aggregate restarted, nor take the state back, in memory or in files', async () => {
+        // Arrange: a save landed through one aggregate, which then stopped; another starts over the same storage
+        const dataDir = await mkdtemp(join(tmpdir(), 'statenet-aggregate-'));
+        closers.push(() => rm(dataDir, { recursive: true, force: true }));
+        const storages = [createMemoryEpochStorage(), createFileEpochStorage({ dataDir })];
+        for (const storage of storages) await createAggregate(storage).persist(ADDRESS, stored(5, { n: 'five' }), 2);
+
+        // Act
+        const answers = [];
+        for (const storage of storages) {
+            const restarted = createAggregate(storage);
+            answers.push(await restarted.persist(ADDRESS, stored(5, { n: 'sent again' }), 2), await restarted.persist(ADDRESS, stored(4, { n: 'older' }), 2));
+        }
+        const states = await Promise.all(storages.map(async (storage) => (await storage.load(ADDRESS))?.state));
+        const next = await createAggregate(storages[1] as EpochStorage).persist(ADDRESS, stored(6, { n: 'six' }), 2);
+
+        // Assert
+        expect(answers.map((answer) => answer.result)).toEqual(['saved', 'saved', 'saved', 'saved']);
+        expect(states).toEqual([{ n: 'five' }, { n: 'five' }]);
+        expect(next).toEqual({ result: 'saved', revision: 6 });
+        expect((await (storages[1] as EpochStorage).load(ADDRESS))?.state).toEqual({ n: 'six' });
+    });
+
     it('should fold the saves that arrive while one runs into one batch, and answer each when it lands', async () => {
         // Arrange
         const { storage, saved, hold, release } = gatedStorage();
