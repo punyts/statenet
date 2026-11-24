@@ -9,7 +9,7 @@ import { createServing } from './serving.js';
 import type { RouteTarget, Serving, ServingOptions } from './serving.js';
 import type { NodeCertificateClaims } from './certificates.js';
 import type { KeyPair, NodeRole } from './certificates.js';
-import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
+import { MESH_PROTOCOL, parseLinkMessage, saidOf, sayOf } from './protocol.js';
 import { createRelayTree } from './relayTree.js';
 import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 
@@ -173,7 +173,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     const outbox: MeshMessage[] = [];
     let scheduled = false;
     /** Tunnelled sessions by id; `sent` once the parent was told to open it, `buffer` what waits until then */
-    const tunnels = new Map<number, { address: string; access?: Access; to?: string; connection: AuthorityConnection; sent: boolean; buffer: string[] }>();
+    const tunnels = new Map<number, { address: string; access?: Access; to?: string; connection: AuthorityConnection; sent: boolean; buffer: (string | Uint8Array)[] }>();
     /** Claims and takes by id, each sent once the link is open; a dropped link answers those it sent with nothing */
     const claims = new Map<number, { address: string; to?: string; from?: string; sent: boolean; done: (handoff: Handoff | undefined) => void }>();
     const takes = new Map<number, { address: string; to?: string; sent: boolean; done: (ok: boolean) => void }>();
@@ -214,7 +214,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         if (tunnel === undefined || tunnel.sent || !ready) return;
         tunnel.sent = true;
         queue({ type: 'open', tid, address: tunnel.address, ...(tunnel.access === undefined ? {} : { access: tunnel.access }), ...(tunnel.to === undefined ? {} : { to: tunnel.to }) });
-        for (const text of tunnel.buffer.splice(0)) queue({ type: 'say', tid, text });
+        for (const text of tunnel.buffer.splice(0)) queue({ type: 'say', tid, ...sayOf(text) });
     };
 
     /** A message of the handshake, in the clear */
@@ -364,7 +364,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 options.onDirectory?.(message.directory);
                 return;
             case 'say':
-                tunnels.get(message.tid)?.connection.send(message.text);
+                tunnels.get(message.tid)?.connection.send(saidOf(message));
                 return;
             case 'shut': {
                 const tunnel = tunnels.get(message.tid);
@@ -564,7 +564,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 receive: (text) => {
                     const tunnel = tunnels.get(tid);
                     if (tunnel === undefined) return;
-                    if (tunnel.sent) queue({ type: 'say', tid, text });
+                    if (tunnel.sent) queue({ type: 'say', tid, ...sayOf(text) });
                     else tunnel.buffer.push(text);
                 },
                 close: () => {

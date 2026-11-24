@@ -1,5 +1,5 @@
 import { createStore } from '@punyts/state';
-import { createStoreBridge, createSyncClient } from '@punyts/state-sync';
+import { createStoreBridge, createSyncClient, createSyncWire } from '@punyts/state-sync';
 import type { Change, SyncTransport } from '@punyts/state-sync';
 import { createAuthorityUpstream, createMemoryEpochStorage, createMemoryOwnershipStore, createRelay, generateGrantKey, OwnerNode, signGrant } from '@punyts/state-sync/authority';
 import type { Access, Authority, GrantContext } from '@punyts/state-sync/authority';
@@ -32,15 +32,16 @@ async function serve(accessOf: () => Access) {
     return { alice, authority, clients };
 }
 
-/** A browser on protocol 3 over a WebSocket */
+/** A browser on protocol 4 over a WebSocket */
 function browser(url: string) {
     const transport: SyncTransport = {
         connect: (handlers) => {
             const socket = new WebSocket(url);
             socket.onopen = () => handlers.onOpen();
-            socket.onmessage = (event) => handlers.onMessage(String(event.data));
+            socket.binaryType = 'arraybuffer';
+            socket.onmessage = (event) => handlers.onMessage(typeof event.data === 'string' ? event.data : new Uint8Array(event.data as ArrayBuffer));
             socket.onclose = () => handlers.onClose();
-            return { send: (text) => socket.send(text), close: () => socket.close() };
+            return { send: (data) => socket.send(data), close: () => socket.close() };
         }
     };
     const store = createStore({});
@@ -82,8 +83,9 @@ describe("a relay's browsers", () => {
         const grant = signGrant({ kid: 'alice-1', issuer: 'alice', subject: 'bob', owner: 'alice', pattern: '$.notes.user.data', rights: ['request'], issued: Date.now(), expires: Date.now() + HOUR }, alice.privateKey);
         const asked: Change = { id: 'r1', path: '$.data.title', op: 'set', value: 'Suggested', base: 0 };
         const bob = authority.connect({ send: () => undefined, close: () => undefined }, { subject: 'bob', grant });
-        bob.receive(JSON.stringify({ type: 'hello', namespace: namespaceOfAddress(ADDRESS), revision: 0, clientId: 'bob-1', protocol: 3 }));
-        bob.receive(JSON.stringify({ type: 'change', change: asked }));
+        const wire = createSyncWire();
+        bob.receive(wire.write({ type: 'hello', namespace: namespaceOfAddress(ADDRESS), revision: 0, clientId: 'bob-1', protocol: 4 }));
+        bob.receive(wire.write({ type: 'change', change: asked }));
         const owner = browser(clients.url);
         await vi.waitFor(() => expect(owner.client.requests()).toMatchObject([{ id: 'r1', mine: false, status: 'pending' }]));
 

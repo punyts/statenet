@@ -1,5 +1,5 @@
 import { createStore } from '@punyts/state';
-import { createStoreBridge, createSyncClient } from '@punyts/state-sync';
+import { createStoreBridge, createSyncClient, createSyncWire } from '@punyts/state-sync';
 import type { Change, JsonValue, RevisedChange, SyncTransport } from '@punyts/state-sync';
 import { createAuthorityUpstream, createMemoryEpochStorage, createMemoryOwnershipStore, createRelay, generateGrantKey, OwnerNode, signGrant } from '@punyts/state-sync/authority';
 import type { RelayListener } from '@punyts/state-sync/authority';
@@ -68,15 +68,19 @@ function browser(url: string) {
     const transport: SyncTransport = {
         connect: (handlers) => {
             const socket = new WebSocket(url);
+            socket.binaryType = 'arraybuffer';
+            // reads every message the client reads, in order, so it numbers paths as the client's wire does
+            const reader = createSyncWire();
             socket.onopen = () => handlers.onOpen();
             socket.onmessage = (event) => {
-                const text = String(event.data);
-                const message = JSON.parse(text) as { type: string; changes?: RevisedChange[] };
-                if (message.type === 'changes' || message.type === 'welcome') for (const each of message.changes ?? []) ids.push(each.id);
-                handlers.onMessage(text);
+                const data = typeof event.data === 'string' ? event.data : new Uint8Array(event.data as ArrayBuffer);
+                const parsed = reader.read(data);
+                const message = parsed.ok ? parsed.message : undefined;
+                if (message?.type === 'changes' || message?.type === 'welcome') for (const each of (message.changes ?? []) as RevisedChange[]) ids.push(each.id);
+                handlers.onMessage(data);
             };
             socket.onclose = () => handlers.onClose();
-            return { send: (text) => socket.send(text), close: () => socket.close() };
+            return { send: (data) => socket.send(data), close: () => socket.close() };
         }
     };
     const store = createStore({});

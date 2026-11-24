@@ -1,5 +1,6 @@
 import type { Change } from '@punyts/state-sync';
 import type { Access, AuthorityConnection, AuthoritySession, Handoff, RelayListener, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
+import { saidOf, sayOf } from './protocol.js';
 import type { MeshMessage } from './protocol.js';
 
 /**
@@ -92,7 +93,7 @@ export function createLinkClient(push: (message: MeshMessage) => void, options: 
             push({ type: 'open', tid, address, ...(access === undefined ? {} : { access }) });
             return {
                 receive: (text) => {
-                    if (tunnels.has(tid)) push({ type: 'say', tid, text });
+                    if (tunnels.has(tid)) push({ type: 'say', tid, ...sayOf(text) });
                 },
                 close: () => {
                     if (tunnels.delete(tid)) push({ type: 'shut', tid, reason: 'closed' });
@@ -155,7 +156,7 @@ export function createLinkClient(push: (message: MeshMessage) => void, options: 
                     return;
                 }
                 case 'say':
-                    tunnels.get(message.tid)?.send(message.text);
+                    tunnels.get(message.tid)?.send(saidOf(message));
                     return;
                 case 'shut': {
                     const connection = tunnels.get(message.tid);

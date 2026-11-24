@@ -84,7 +84,7 @@ function view(node: OwnerMesh) {
     const transport: SyncTransport = {
         connect: (handlers) => {
             let session: AuthoritySession | undefined;
-            const waiting: string[] = [];
+            const waiting: (string | Uint8Array)[] = [];
             let gone = false;
             opened++;
             void node

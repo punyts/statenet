@@ -3,7 +3,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 import { isReported, report } from "@punyts/core";
-import { parseMessage } from "@punyts/state-sync";
+import { createSyncWire, parseMessage, wireTypeOf } from "@punyts/state-sync";
 import type { ErrorMessage } from "@punyts/state-sync";
 import { createAuthority } from "@punyts/state-sync/authority";
 import type { Authority, AuthoritySession, NamespaceStorage } from "@punyts/state-sync/authority";
@@ -34,7 +34,7 @@ interface Member {
     clientId: string;
     /** No `Origin`: an app server, not a web page */
     server: boolean;
-    send: (text: string) => void;
+    send: (data: Uint8Array) => void;
 }
 
 export interface StatenetOptions {
@@ -67,8 +67,16 @@ export interface RunningStatenet {
 
 const errorMessage = (code: string, message: string): string => JSON.stringify({ type: "error", code, message } satisfies ErrorMessage);
 
-const textOf = (data: RawData): string =>
-    Array.isArray(data) ? Buffer.concat(data).toString("utf8") : Buffer.from(data as ArrayBuffer).toString("utf8");
+const bufferOf = (data: RawData): Buffer => (Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data));
+
+/** A frame as the sync wire reads it: a text frame as text, a binary one as bytes */
+const frameOf = (data: RawData, isBinary: boolean): string | Uint8Array => {
+    const buffer = bufferOf(data);
+    return isBinary ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).slice() : buffer.toString("utf8");
+};
+
+/** Emits carry no path or id, so one wire reads and writes them for every connection without touching its path numbers */
+const emits = createSyncWire();
 
 /**
  * Starts the statenet: one authority per namespace, with no server logic of its own, behind a WebSocket endpoint at
@@ -105,12 +113,12 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
      * The emit relay: an emit from an app server (no `Origin`) goes to every other client of the namespace, an emit
      * from a web page to the app servers only. Nothing of it is kept: a client that is not connected misses it
      */
-    const relayEmit = (namespace: string, from: Member, text: string): void => {
-        if (!text.includes('"emit"')) return;
-        const parsed = parseMessage(text);
+    const relayEmit = (namespace: string, from: Member, data: string | Uint8Array): void => {
+        if (wireTypeOf(data) !== "emit") return;
+        const parsed = emits.read(data);
         if (!parsed.ok || parsed.message.type !== "emit") return;
         const { name, value } = parsed.message;
-        const relayed = JSON.stringify(value === undefined ? { type: "emit", name } : { type: "emit", name, value });
+        const relayed = emits.write(value === undefined ? { type: "emit", name } : { type: "emit", name, value }) as Uint8Array;
         if (isReported(CATEGORY)) report(CATEGORY, "Relaying the emit %s of %s from %s", [name, namespace, from.server ? "an app server" : "a page"]);
         for (const member of members.get(namespace) ?? []) {
             if (member === from || (!from.server && !member.server)) continue;
@@ -126,7 +134,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
             members.delete(namespace);
             return;
         }
-        const notice = JSON.stringify({ type: "emit", name: LEFT_EMIT, value: { clientId: member.clientId } });
+        const notice = emits.write({ type: "emit", name: LEFT_EMIT, value: { clientId: member.clientId } }) as Uint8Array;
         for (const other of joined) other.send(notice);
     };
 
@@ -139,7 +147,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         let joinedNamespace = "";
         let opening = false;
         let closed = false;
-        const pending: string[] = [];
+        const pending: (string | Uint8Array)[] = [];
         const timer = setInterval(() => ws.ping(), KEEP_ALIVE_MS);
         const refuse = (code: string, message: string, closeCode: number): void => {
             report(CATEGORY, "Refused a connection: %s", [code]);
@@ -148,19 +156,19 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
         };
 
         ws.on("message", (data, isBinary) => {
-            if (isBinary) return refuse("binary", "Text frames only", 1003);
-            const text = textOf(data);
+            const frame = frameOf(data, isBinary);
             if (session !== undefined) {
-                session.receive(text);
-                if (member !== undefined) relayEmit(joinedNamespace, member, text);
+                session.receive(frame);
+                if (member !== undefined) relayEmit(joinedNamespace, member, frame);
                 return;
             }
             if (opening) {
                 if (pending.length >= MAX_PENDING) return refuse("too-many", "Too many messages before the namespace loaded", 1008);
-                pending.push(text);
+                pending.push(frame);
                 return;
             }
-            const parsed = parseMessage(text);
+            if (typeof frame !== "string") return refuse("hello-first", "The first message must be hello", 1008);
+            const parsed = parseMessage(frame);
             if (!parsed.ok) return refuse(parsed.error.code, parsed.error.message, 1008);
             if (parsed.message.type !== "hello") return refuse("hello-first", "The first message must be hello", 1008);
             const { namespace, clientId } = parsed.message;
@@ -175,7 +183,7 @@ export const startStatenet = async (options: StatenetOptions): Promise<RunningSt
                         close: () => ws.close()
                     });
                     report(CATEGORY, "Client %s joined %s from %s", [clientId, namespace, server ? "an app server" : "a page"]);
-                    session.receive(text);
+                    session.receive(frame);
                     const joining: Member = {
                         clientId,
                         server,

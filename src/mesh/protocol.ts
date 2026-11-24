@@ -74,10 +74,10 @@ export type MeshMessage =
     | { type: 'certified'; rid: number; certificate?: string }
     /**
      * A session of a namespace the node at the other end owns, tunnelled for a view this node serves: `open` starts it,
-     * `say` carries each sync message either way as its text, `shut` ends it from either end
+     * `say` carries each sync message either way as the sync wire wrote it (`Said`), `shut` ends it from either end
      */
     | { type: 'open'; tid: number; address: string; access?: Access; to?: string }
-    | { type: 'say'; tid: number; text: string }
+    | ({ type: 'say'; tid: number } & Said)
     | { type: 'shut'; tid: number; reason: string }
     /** A claim (docs/design/statenet-relays.md, "Ownership moves by a claim"): the owner answers with its handoff, or none */
     | { type: 'claim'; cid: number; address: string; to?: string; from?: string }
@@ -94,6 +94,19 @@ export type MeshMessage =
     | { type: 'relay-linked'; certificate: string; via: string }
     /** The last link of relay `id` to relay `via` closed: it and every relay under it are unlisted */
     | { type: 'relay-unlinked'; id: string; via: string };
+
+/**
+ * A sync message in a `say`: `hello` and `error` as `text`, every other message of sync protocol 4 as its bytes in
+ * base64, since a frame is JSON text until mesh protocol 5 (docs/design/statenet-wire-format.md, W3)
+ */
+export type Said = { text: string } | { bytes: string };
+
+/** A sync message as the wire wrote it, for a `say` */
+export const sayOf = (data: string | Uint8Array): Said =>
+    typeof data === 'string' ? { text: data } : { bytes: Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('base64') };
+
+/** The sync message of a `say`, as the wire reads it */
+export const saidOf = (said: Said): string | Uint8Array => ('bytes' in said ? new Uint8Array(Buffer.from(said.bytes, 'base64')) : said.text);
 
 /** Many messages from one moment, of many namespaces, in one WebSocket message */
 export type MeshFrame = { type: 'frame'; messages: MeshMessage[] };

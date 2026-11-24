@@ -2,6 +2,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addListener, removeListener, setCategories } from "@punyts/core";
+import { createSyncWire } from "@punyts/state-sync";
+import type { SyncMessage } from "@punyts/state-sync";
 import { WebSocket } from "ws";
 import { NAMESPACE_FILE } from "./FileNamespaceStorage.js";
 import { LEFT_EMIT, startStatenet } from "./Statenet.js";
@@ -21,8 +23,12 @@ const connect = (url: string, headers: Record<string, string> = {}): Promise<Tes
     const socket = new WebSocket(url, { headers });
     const received: Message[] = [];
     const waits: { match: (message: Message) => boolean; resolve: (message: Message) => void }[] = [];
-    socket.on("message", (data) => {
-        const message = JSON.parse(String(data)) as Message;
+    const wire = createSyncWire();
+    socket.on("message", (data, isBinary) => {
+        const buffer = Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data);
+        const parsed = wire.read(isBinary ? new Uint8Array(buffer) : buffer.toString("utf8"));
+        if (!parsed.ok) throw new Error(`the statenet sent what the wire cannot read: ${parsed.error.message}`);
+        const message = parsed.message as unknown as Message;
         received.push(message);
         for (const wait of [...waits]) {
             if (!wait.match(message)) continue;
@@ -40,13 +46,13 @@ const connect = (url: string, headers: Record<string, string> = {}): Promise<Tes
         });
     };
     return new Promise((resolve, reject) => {
-        socket.once("open", () => resolve({ socket, received, next, send: (message) => socket.send(JSON.stringify(message)), closed }));
+        socket.once("open", () => resolve({ socket, received, next, send: (message) => socket.send(wire.write(message as SyncMessage)), closed }));
         socket.once("error", reject);
     });
 };
 
 const hello = (client: TestClient, namespace: string, revision: number, clientId: string): Promise<Message> => {
-    client.send({ type: "hello", namespace, revision, clientId, protocol: 1 });
+    client.send({ type: "hello", namespace, revision, clientId, protocol: 4 });
     return client.next((message) => message["type"] === "welcome");
 };
 

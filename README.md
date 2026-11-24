@@ -19,7 +19,9 @@ npx statenet --data-dir ./data
 | `--log-length <n>` | `STATENET_LOG_LENGTH` | `1000` | Recent changes each namespace keeps for catching clients up |
 | `--allow-origin <url>` | `STATENET_ALLOW_ORIGINS` (comma-separated) | none | A browser origin that may connect; repeat for more |
 
-Clients connect to `ws://<host>:<port>/sync`. `GET /health` answers `{ "ok": true }`. `npm start` runs `node dist/cli.js`.
+Clients connect to `ws://<host>:<port>/sync` and speak sync protocol 4: a `hello` as a text frame, then binary frames
+(`createSyncWire` in state-sync). The emit relay picks emits out by their first bytes (`wireTypeOf`) and sends each on
+as the same bytes, since an emit carries no numbered path. `GET /health` answers `{ "ok": true }`. `npm start` runs `node dist/cli.js`.
 
 ### Reporting
 Both bins write reports to stderr, one line each, `[statenet] <category> <message>` (`[statenet-relay]` for the
@@ -108,7 +110,7 @@ serves its namespaces down, and relays cache what is subscribed through them and
 - A write goes to the namespace's owner node with the writer's access, so the owner's authority can check it; one from
   someone who may only request the path comes back `requested` and waits there for a decision
   (`docs/design/statenet-requests.md`). A decider anywhere decides over a session tunnelled to the owner. A relay's
-  browsers on protocol 3 get their requests from a requests-only session tunnelled to the owner, in their welcome and
+  browsers get their requests from a requests-only session tunnelled to the owner, in their welcome and
   as they are made and decided, and decide through it.
 - An aggregate is the only writer of state: `startAggregateNode` (or `createAggregate` in the node's own process) saves
   what nodes send it, and `createAggregateStorage` is the storage a node uses to save through one. With no database,
