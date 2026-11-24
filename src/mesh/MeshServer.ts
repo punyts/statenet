@@ -10,7 +10,7 @@ import { checkProof, mayLink, newNonce, proveNode, verifyNodeCertificate } from 
 import type { KeyPair, NodeCertificateClaims, NodeRole } from './certificates.js';
 import { createLinkClient } from './linkClient.js';
 import type { LinkClient } from './linkClient.js';
-import { MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
+import { decodeLinkMessage, encodeLinkMessage, MAX_LINK_MESSAGE_BYTES, MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
 import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 import { newShare, sealOf, transcript } from './sealing.js';
 import type { LinkSeal } from './sealing.js';
@@ -145,7 +145,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
     const now = options.now ?? Date.now;
     const links = new Set<Link>();
     const http: HttpServer = options.tls === undefined ? createHttpServer() : (createHttpsServer({ key: options.tls.key, cert: options.tls.cert }) as unknown as HttpServer);
-    const wss = new WebSocketServer({ server: http, maxPayload: 16 * 1024 * 1024 });
+    const wss = new WebSocketServer({ server: http, maxPayload: MAX_LINK_MESSAGE_BYTES });
 
     /** A message of the handshake, in the clear */
     const send = (socket: WebSocket, message: LinkMessage): void => {
@@ -153,7 +153,7 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
     };
     /** A message of an open link, sealed */
     const sendSealed = (link: Link, message: LinkMessage): void => {
-        if (link.socket.readyState === link.socket.OPEN) link.socket.send(link.seal.seal(JSON.stringify(message)));
+        if (link.socket.readyState === link.socket.OPEN) link.socket.send(link.seal.seal(encodeLinkMessage(message, (type) => report.warning('Node %s left out a %s it could not encode for %s', [options.nodeId, type, link.peer.nodeId]))));
     };
     const certificate = (): string => (typeof options.certificate === 'string' ? options.certificate : options.certificate());
     const listed = (claims: NodeCertificateClaims): boolean =>
@@ -193,8 +193,8 @@ export async function startMeshServer(options: MeshServerOptions): Promise<MeshS
         socket.on('message', (data, isBinary) => {
             if (link !== undefined) {
                 // an open link carries sealed messages only: one that does not open was changed, replayed or lost one before it
-                const text = isBinary ? link.seal.open(data) : undefined;
-                const sealed = text === undefined ? undefined : parseLinkMessage(text);
+                const unsealed = isBinary ? link.seal.open(data) : undefined;
+                const sealed = unsealed === undefined ? undefined : decodeLinkMessage(unsealed);
                 if (sealed === undefined) return socket.close(4400, 'a message on the link did not open');
                 if (sealed.type === 'frame') {
                     // `rev` answers what this node asked of the node below; the rest are the node's own asks

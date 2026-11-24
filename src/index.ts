@@ -6,7 +6,7 @@ export { checkProof, generateKeyPair, issueNodeCertificate, mayLink, newNonce, p
 export { newShare, sealOf, transcript } from "./mesh/sealing.js";
 export type { LinkSeal, LinkShare } from "./mesh/sealing.js";
 export type { KeyPair, NodeCertificateClaims, NodeRole } from "./mesh/certificates.js";
-export { MESH_PROTOCOL, parseLinkMessage } from "./mesh/protocol.js";
+export { decodeLinkMessage, encodeLinkMessage, MAX_LINK_MESSAGE_BYTES, MESH_PROTOCOL, parseLinkMessage } from "./mesh/protocol.js";
 export type { DirectoryView, LinkMessage, MeshFrame, MeshMessage } from "./mesh/protocol.js";
 export { startMeshServer } from "./mesh/MeshServer.js";
 export type { MeshServer, MeshServerOptions, MeshServerStats, MeshWriter, OpenedLink, SessionEndpoint } from "./mesh/MeshServer.js";

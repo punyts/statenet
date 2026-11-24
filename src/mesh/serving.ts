@@ -3,7 +3,6 @@ import type { Change, RevisedChange } from '@punyts/state-sync';
 import type { Access, Authority, AuthorityConnection, AuthoritySession, Handoff, RelayBatch, RelaySubscription, StoredNamespace, Upstream, WriteOutcome } from '@punyts/state-sync/authority';
 import { verifyNodeCertificate } from './certificates.js';
 import type { NodeCertificateClaims } from './certificates.js';
-import { saidOf, sayOf } from './protocol.js';
 import type { LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 
 /** The category of a link's serving: node ids, addresses, prefixes and counts, never values */
@@ -225,7 +224,7 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
                 const session = endpoint.connect(
                     {
                         send: (text) => {
-                            if (open) push({ type: 'say', tid, ...sayOf(text) });
+                            if (open) push({ type: 'say', tid, data: text });
                         },
                         close: () => {
                             if (!open) return;
@@ -242,8 +241,8 @@ export function createServing(options: ServingOptions, peer: NodeCertificateClai
             }
             case 'say': {
                 const pending = opening.get(message.tid);
-                if (pending !== undefined) pending.said.push(saidOf(message));
-                else tunnels.get(message.tid)?.receive(saidOf(message));
+                if (pending !== undefined) pending.said.push(message.data);
+                else tunnels.get(message.tid)?.receive(message.data);
                 return;
             }
             case 'shut': {

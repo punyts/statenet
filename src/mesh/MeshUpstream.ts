@@ -9,7 +9,7 @@ import { createServing } from './serving.js';
 import type { RouteTarget, Serving, ServingOptions } from './serving.js';
 import type { NodeCertificateClaims } from './certificates.js';
 import type { KeyPair, NodeRole } from './certificates.js';
-import { MESH_PROTOCOL, parseLinkMessage, saidOf, sayOf } from './protocol.js';
+import { decodeLinkMessage, encodeLinkMessage, MAX_LINK_MESSAGE_BYTES, MESH_PROTOCOL, parseLinkMessage } from './protocol.js';
 import { createRelayTree } from './relayTree.js';
 import type { DirectoryView, LinkMessage, LoadOutcome, MeshMessage, PersistOutcome, RemoveOutcome } from './protocol.js';
 
@@ -214,7 +214,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         if (tunnel === undefined || tunnel.sent || !ready) return;
         tunnel.sent = true;
         queue({ type: 'open', tid, address: tunnel.address, ...(tunnel.access === undefined ? {} : { access: tunnel.access }), ...(tunnel.to === undefined ? {} : { to: tunnel.to }) });
-        for (const text of tunnel.buffer.splice(0)) queue({ type: 'say', tid, ...sayOf(text) });
+        for (const text of tunnel.buffer.splice(0)) queue({ type: 'say', tid, data: text });
     };
 
     /** A message of the handshake, in the clear */
@@ -223,7 +223,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
     };
     /** A message of the open link, sealed */
     const sendSealed = (message: LinkMessage): void => {
-        if (socket !== undefined && socket.readyState === WebSocket.OPEN && seal !== undefined) socket.send(seal.seal(JSON.stringify(message)));
+        if (socket !== undefined && socket.readyState === WebSocket.OPEN && seal !== undefined) socket.send(seal.seal(encodeLinkMessage(message, (type) => report.warning('Node %s left out a %s it could not encode for its parent', [options.nodeId, type]))));
     };
     const queue = (message: MeshMessage): void => {
         if (!ready) return;
@@ -364,7 +364,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 options.onDirectory?.(message.directory);
                 return;
             case 'say':
-                tunnels.get(message.tid)?.connection.send(saidOf(message));
+                tunnels.get(message.tid)?.connection.send(message.data);
                 return;
             case 'shut': {
                 const tunnel = tunnels.get(message.tid);
@@ -446,7 +446,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
         report(CATEGORY, 'Node %s links to the parent at %s', [options.nodeId, url]);
         const nonce = newNonce();
         const mine = newShare();
-        const link = new WebSocket(url);
+        const link = new WebSocket(url, { maxPayload: MAX_LINK_MESSAGE_BYTES });
         socket = link;
         seal = undefined;
         const refuse = (why: string): void => {
@@ -466,8 +466,8 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
             lastHeard = now();
             if (seal !== undefined) {
                 // past the handshake every message is sealed: one that does not open was changed, replayed or lost one before it
-                const text = isBinary ? seal.open(data) : undefined;
-                const sealed = text === undefined ? undefined : parseLinkMessage(text);
+                const unsealed = isBinary ? seal.open(data) : undefined;
+                const sealed = unsealed === undefined ? undefined : decodeLinkMessage(unsealed);
                 if (sealed === undefined) return refuse('a message on the link did not open');
                 if (sealed.type !== 'frame') return;
                 let messages = sealed.messages;
@@ -564,7 +564,7 @@ export function createMeshUpstream(options: MeshUpstreamOptions): MeshUpstream {
                 receive: (text) => {
                     const tunnel = tunnels.get(tid);
                     if (tunnel === undefined) return;
-                    if (tunnel.sent) queue({ type: 'say', tid, ...sayOf(text) });
+                    if (tunnel.sent) queue({ type: 'say', tid, data: text });
                     else tunnel.buffer.push(text);
                 },
                 close: () => {

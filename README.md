@@ -98,7 +98,8 @@ serves its namespaces down, and relays cache what is subscribed through them and
   to a relay or a node beside it, a relay to an aggregate or a relay). A server can also ask that a node be in the
   directory (`requireListed`).
 - Everything on a link after its handshake is sealed with a key the two ends agree in it, with or without TLS
-  underneath (`docs/design/statenet-network.md`).
+  underneath (`docs/design/statenet-network.md`). The handshake is JSON text; what is sealed is CBOR (mesh protocol 5,
+  `docs/design/statenet-wire-format.md`), and a tunnelled session's sync messages go in it as the sync wire wrote them.
 - A node links up to a relay (`startOwnerMesh` with `relays`), and a link carries asks both ways, so the relay
   reaches the nodes below it. Nodes are in groups (`group`, in their certificates): those of one group link to each
   other directly, and what is for a node of another group goes through the relays, which find it by the directory:

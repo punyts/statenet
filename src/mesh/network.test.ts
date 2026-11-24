@@ -9,7 +9,7 @@ import { startMeshServer } from './MeshServer.js';
 import type { MeshServerOptions } from './MeshServer.js';
 import { createMeshUpstream } from './MeshUpstream.js';
 import type { MeshUpstreamOptions } from './MeshUpstream.js';
-import { MESH_PROTOCOL } from './protocol.js';
+import { encodeLinkMessage, MESH_PROTOCOL } from './protocol.js';
 import type { DirectoryView, LinkMessage } from './protocol.js';
 import { startRelayNode } from './RelayNode.js';
 import { newShare, sealOf, transcript } from './sealing.js';
@@ -236,17 +236,17 @@ describe('sealed links', () => {
         const again = sealOf(parent, dialler.share, challenges, 'server') as LinkSeal;
 
         // Act
-        const first = down.seal('one');
-        const second = down.seal('two');
+        const first = down.seal(Buffer.from('one'));
+        const second = down.seal(Buffer.from('two'));
         const changed = Buffer.from(first);
         changed[0] = (changed[0] as number) ^ 1;
 
         // Assert
         expect(first.toString('utf8')).not.toContain('one');
         expect(up.open(changed)).toBeUndefined();
-        expect(up.open(first)).toBe('one');
+        expect(up.open(first)?.toString('utf8')).toBe('one');
         expect(up.open(first)).toBeUndefined();
-        expect(up.open(second)).toBe('two');
+        expect(up.open(second)?.toString('utf8')).toBe('two');
         expect(again.open(second)).toBeUndefined();
         expect(down.open(first)).toBeUndefined();
         expect(sealOf(dialler, 'not-a-key', challenges, 'dialler')).toBeUndefined();
@@ -264,7 +264,7 @@ describe('sealed links', () => {
         const atParent = sealOf(parent, dialler.share, challenges, 'server') as LinkSeal;
 
         // Assert: and the proofs sign the shares each end saw, so they do not check either
-        expect(atParent.open(toParent.seal('secret'))).toBeUndefined();
+        expect(atParent.open(toParent.seal(Buffer.from('secret')))).toBeUndefined();
         const seenByDialler = { diallerShare: dialler.share, serverShare: between.share, dialler: 'd', server: 's' };
         const seenByParent = { diallerShare: dialler.share, serverShare: parent.share, dialler: 'd', server: 's' };
         expect(transcript('server', 'a', seenByDialler)).not.toBe(transcript('server', 'a', seenByParent));
@@ -288,12 +288,56 @@ describe('sealed links', () => {
         // Arrange
         const parent = await server('node-1', 'owner');
         const link = await handshake(parent.mesh.url, 'relay-1', 'relay');
-        const frame = link.seal.seal(JSON.stringify({ type: 'frame', messages: [{ type: 'credit', amount: 10 }] }));
+        const frame = link.seal.seal(encodeLinkMessage({ type: 'frame', messages: [{ type: 'credit', amount: 10 }] }));
 
         // Act
         link.socket.send(frame);
         await vi.waitFor(() => expect(parent.mesh.stats().links[0]?.credit).toBe(10));
         link.socket.send(frame);
+
+        // Assert
+        expect(await link.closed).toBe(4400);
+    });
+});
+
+describe('mesh protocol 5', () => {
+    it('should refuse a hello of mesh protocol 4, and say which protocol it speaks', async () => {
+        // Arrange
+        const node = await server('node-1', 'owner');
+        const keys = generateKeyPair();
+        const socket = new WebSocket(node.mesh.url);
+        closers.push(() => socket.terminate());
+        await new Promise((resolve) => socket.on('open', resolve));
+        const answer = new Promise<LinkMessage>((resolve) => socket.once('message', (data) => resolve(JSON.parse(String(data)))));
+
+        // Act
+        socket.send(JSON.stringify({ type: 'link-hello', nodeId: 'relay-1', role: 'relay', protocol: 4, region: '', certificate: certificateFor('relay-1', 'relay', keys), nonce: 'n', share: newShare().share }));
+
+        // Assert
+        expect(await answer).toEqual({ type: 'link-refused', reason: 'this node speaks mesh protocol 5' });
+    });
+
+    it('should close a link on a sealed frame of JSON text, as mesh protocol 4 sealed it', async () => {
+        // Arrange
+        const parent = await server('node-1', 'owner');
+        const link = await handshake(parent.mesh.url, 'relay-1', 'relay');
+
+        // Act
+        link.socket.send(link.seal.seal(Buffer.from(JSON.stringify({ type: 'frame', messages: [{ type: 'credit', amount: 10 }] }))));
+
+        // Assert
+        expect(await link.closed).toBe(4400);
+        expect(parent.mesh.stats().links).toEqual([]);
+    });
+
+    it("should close a link on a sealed frame that holds bytes anywhere but a say's data", async () => {
+        // Arrange
+        const parent = await server('node-1', 'owner');
+        const link = await handshake(parent.mesh.url, 'relay-1', 'relay');
+        const frame = { type: 'frame', messages: [{ type: 'write', wid: 1, address: '1.notes', change: { id: 'c1', path: '$.data.a', op: 'set', value: new Uint8Array([1, 2]), base: 0 } }] };
+
+        // Act
+        link.socket.send(link.seal.seal(encodeLinkMessage(frame as unknown as LinkMessage)));
 
         // Assert
         expect(await link.closed).toBe(4400);

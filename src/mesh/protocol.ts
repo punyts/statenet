@@ -1,9 +1,13 @@
-import type { Change } from '@punyts/state-sync';
+import { decodeCbor, DEFAULT_SYNC_LIMITS, encodeCbor } from '@punyts/state-sync';
+import type { CborValue, Change } from '@punyts/state-sync';
 import type { Access, GrantKey, RelayBatch, RelayWelcome, StoredNamespace, WriteOutcome } from '@punyts/state-sync/authority';
 import type { NodeRole } from './certificates.js';
 
 /** The version of the mesh protocol, named in `link-hello` */
-export const MESH_PROTOCOL = 4;
+export const MESH_PROTOCOL = 5;
+
+/** The longest WebSocket message a link carries, and so the longest sealed frame */
+export const MAX_LINK_MESSAGE_BYTES = 16 * 1024 * 1024;
 
 /**
  * What a parent tells a node below it about the statenet (docs/design/statenet-relays.md, "The directory"), so a relay
@@ -74,10 +78,11 @@ export type MeshMessage =
     | { type: 'certified'; rid: number; certificate?: string }
     /**
      * A session of a namespace the node at the other end owns, tunnelled for a view this node serves: `open` starts it,
-     * `say` carries each sync message either way as the sync wire wrote it (`Said`), `shut` ends it from either end
+     * `say` carries each sync message either way as the sync wire wrote it (`hello` and `error` as text, the rest as
+     * bytes), `shut` ends it from either end
      */
     | { type: 'open'; tid: number; address: string; access?: Access; to?: string }
-    | ({ type: 'say'; tid: number } & Said)
+    | { type: 'say'; tid: number; data: string | Uint8Array }
     | { type: 'shut'; tid: number; reason: string }
     /** A claim (docs/design/statenet-relays.md, "Ownership moves by a claim"): the owner answers with its handoff, or none */
     | { type: 'claim'; cid: number; address: string; to?: string; from?: string }
@@ -95,25 +100,12 @@ export type MeshMessage =
     /** The last link of relay `id` to relay `via` closed: it and every relay under it are unlisted */
     | { type: 'relay-unlinked'; id: string; via: string };
 
-/**
- * A sync message in a `say`: `hello` and `error` as `text`, every other message of sync protocol 4 as its bytes in
- * base64, since a frame is JSON text until mesh protocol 5 (docs/design/statenet-wire-format.md, W3)
- */
-export type Said = { text: string } | { bytes: string };
-
-/** A sync message as the wire wrote it, for a `say` */
-export const sayOf = (data: string | Uint8Array): Said =>
-    typeof data === 'string' ? { text: data } : { bytes: Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('base64') };
-
-/** The sync message of a `say`, as the wire reads it */
-export const saidOf = (said: Said): string | Uint8Array => ('bytes' in said ? new Uint8Array(Buffer.from(said.bytes, 'base64')) : said.text);
-
 /** Many messages from one moment, of many namespaces, in one WebSocket message */
 export type MeshFrame = { type: 'frame'; messages: MeshMessage[] };
 
 export type LinkMessage = LinkHello | LinkWelcome | LinkProof | LinkRefused | MeshFrame | { type: 'ping' } | { type: 'pong' };
 
-/** Parses one message of a link (the WebSocket's in the handshake, the opened text after it), or undefined when it is not one */
+/** Parses one message of the handshake, JSON text in the clear, or undefined when it is not one */
 export function parseLinkMessage(data: unknown): LinkMessage | undefined {
     try {
         const text = typeof data === 'string' ? data : Buffer.isBuffer(data) ? data.toString('utf8') : Array.isArray(data) ? Buffer.concat(data as Buffer[]).toString('utf8') : Buffer.from(data as ArrayBuffer).toString('utf8');
@@ -122,4 +114,77 @@ export function parseLinkMessage(data: unknown): LinkMessage | undefined {
     } catch {
         return undefined;
     }
+}
+
+/**
+ * Mesh protocol 5 (docs/design/statenet-wire-format.md, W3): past the handshake a link message is CBOR, sealed. A
+ * message's members that are undefined are left out, as JSON leaves them out, and its values nest at most 16 levels
+ * deeper than a sync message's
+ */
+const CBOR_DEPTH = DEFAULT_SYNC_LIMITS.maxDepth + 16;
+const CBOR_LIMITS = { maxBytes: MAX_LINK_MESSAGE_BYTES, maxDepth: CBOR_DEPTH, maxItems: MAX_LINK_MESSAGE_BYTES, maxStringBytes: MAX_LINK_MESSAGE_BYTES };
+
+const encode = (message: LinkMessage | MeshMessage): Uint8Array => encodeCbor(message as unknown as CborValue, { bytes: true, omitUndefined: true, maxDepth: CBOR_DEPTH });
+
+/**
+ * The bytes of a message of an open link, to seal. A frame leaves out a message that cannot be encoded (a value JSON
+ * would not hold, or one nested too deep) and names its type to `dropped`, so one bad value does not end the link
+ */
+export function encodeLinkMessage(message: LinkMessage, dropped?: (type: MeshMessage['type']) => void): Uint8Array {
+    try {
+        return encode(message);
+    } catch (error) {
+        if (message.type !== 'frame') throw error;
+        const kept = message.messages.filter((each) => {
+            try {
+                encode(each);
+                return true;
+            } catch {
+                dropped?.(each.type);
+                return false;
+            }
+        });
+        return encode({ type: 'frame', messages: kept });
+    }
+}
+
+/** Whether a decoded value holds a byte string anywhere */
+const holdsBytes = (value: CborValue): boolean => {
+    if (value instanceof Uint8Array) return true;
+    if (value === null || typeof value !== 'object') return false;
+    if (Array.isArray(value)) return value.some(holdsBytes);
+    for (const key in value) if (holdsBytes(value[key] as CborValue)) return true;
+    return false;
+};
+
+/** Whether a decoded mesh message holds bytes only where a `say` carries them: its data */
+const bytesInPlace = (message: CborValue): boolean => {
+    if (message === null || typeof message !== 'object' || Array.isArray(message) || message instanceof Uint8Array) return !holdsBytes(message);
+    if (message.type === 'say') {
+        const { data, ...rest } = message;
+        return (typeof data === 'string' || data instanceof Uint8Array) && !holdsBytes(rest);
+    }
+    if (message.type === 'rev' && message.message !== undefined) {
+        const { message: inner, ...rest } = message;
+        return bytesInPlace(inner as CborValue) && !holdsBytes(rest);
+    }
+    return !holdsBytes(message);
+};
+
+/**
+ * Reads the opened bytes of a message of an open link, or undefined when they are not one: not CBOR, past the
+ * limits, no `type`, or a byte string anywhere but a `say`'s data, so every other value is JSON's
+ */
+export function decodeLinkMessage(bytes: Uint8Array): LinkMessage | undefined {
+    let value: CborValue;
+    try {
+        value = decodeCbor(bytes, { bytes: true, limits: CBOR_LIMITS });
+    } catch {
+        return undefined;
+    }
+    if (value === null || typeof value !== 'object' || Array.isArray(value) || value instanceof Uint8Array || typeof value.type !== 'string') return undefined;
+    if (value.type === 'frame') {
+        if (!Array.isArray(value.messages) || !value.messages.every(bytesInPlace)) return undefined;
+    } else if (holdsBytes(value)) return undefined;
+    return value as unknown as LinkMessage;
 }

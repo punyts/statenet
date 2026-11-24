@@ -25,11 +25,11 @@ export const newShare = (): LinkShare => {
 export const transcript = (side: 'dialler' | 'server', challenge: string, link: { readonly diallerShare: string; readonly serverShare: string; readonly dialler: string; readonly server: string }): string =>
     ['statenet-link-2', side, challenge, link.diallerShare, link.serverShare, link.dialler, link.server].join('|');
 
-/** One end of a sealed link: `seal` what it sends, `open` what it gets */
+/** One end of a sealed link: `seal` the bytes it sends, `open` what it gets */
 export interface LinkSeal {
-    seal(text: string): Buffer;
-    /** The message, or undefined when it was changed, replayed, dropped before or out of order: the link must close */
-    open(data: unknown): string | undefined;
+    seal(bytes: Uint8Array): Buffer;
+    /** The bytes, or undefined when they were changed, replayed, dropped before or out of order: the link must close */
+    open(data: unknown): Buffer | undefined;
 }
 
 const TAG = 16;
@@ -68,9 +68,9 @@ export function sealOf(mine: LinkShare, theirs: string, challenges: { readonly d
         return bytes;
     };
     return {
-        seal: (text) => {
+        seal: (bytes) => {
             const cipher = createCipheriv('aes-256-gcm', sendKey, nonce(sent++));
-            return Buffer.concat([cipher.update(text, 'utf8'), cipher.final(), cipher.getAuthTag()]);
+            return Buffer.concat([cipher.update(bytes), cipher.final(), cipher.getAuthTag()]);
         },
         open: (data) => {
             const bytes = bytesOf(data);
@@ -78,9 +78,9 @@ export function sealOf(mine: LinkShare, theirs: string, challenges: { readonly d
             try {
                 const decipher = createDecipheriv('aes-256-gcm', receiveKey, nonce(received));
                 decipher.setAuthTag(bytes.subarray(bytes.length - TAG));
-                const text = Buffer.concat([decipher.update(bytes.subarray(0, bytes.length - TAG)), decipher.final()]).toString('utf8');
+                const opened = Buffer.concat([decipher.update(bytes.subarray(0, bytes.length - TAG)), decipher.final()]);
                 received++;
-                return text;
+                return opened;
             } catch {
                 return undefined;
             }

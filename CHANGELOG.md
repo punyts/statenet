@@ -1,12 +1,20 @@
 # Changelog
 
 ## Unreleased
+- **Mesh protocol 5: links carry CBOR** (docs/design/statenet-wire-format.md, W3). Breaking: past the handshake, which
+  stays JSON text, every link message is CBOR before it is sealed (`encodeLinkMessage`, `decodeLinkMessage`), and a
+  node of protocol 4 is refused, so every node of a statenet deploys together. A `say` carries its sync message as
+  `data`, text for `hello` and `error` and the wire's bytes for the rest; the base64 `Said`, `sayOf` and `saidOf`
+  are gone. A frame that holds bytes anywhere but a `say`'s data, or is not CBOR, closes the link (4400). A message
+  that cannot be encoded (a value JSON would not hold) is left out of its frame with a warning naming its type, where
+  JSON text had written it anyway. `LinkSeal`
+  seals and opens bytes. Links take messages up to `MAX_LINK_MESSAGE_BYTES` (16 MiB) at both ends. Tests:
+  `src/mesh/protocol.test.ts`, `src/mesh/network.test.ts` ("mesh protocol 5").
 - **Sync protocol 4 to browsers and app servers** (docs/design/statenet-wire-format.md, W2). Breaking: the statenet and
   a relay's `ClientServer` speak state-sync's protocol 4 (a `hello` as text, then binary frames), and a hello of 1 to 3
   is refused as `invalid-message`; binary frames are no longer refused. Each browser socket has its wire, and so does
   each requests-only session it tunnels. The emit relay finds emits with `wireTypeOf` and passes them on as bytes, the
-  `statenet.left` notice too. Until mesh protocol 5 (W3) a `say` carries a sync message as `text` (hello, error) or as
-  `bytes` in base64 (`Said`, `sayOf`, `saidOf` in `src/mesh/protocol.ts`). Tests: `src/Statenet.test.ts`,
+  `statenet.left` notice too. Tests: `src/Statenet.test.ts`,
   `src/mesh/clientServer.test.ts`, `mesh.test.ts`, `groups.test.ts`, `ownerMesh.test.ts` over the wire.
 - **A relay's browsers get their requests** (docs/design/statenet-requests.md, follow-ups). `ClientServer` takes `open` (a session with the owner's authority; `RelayNode` passes `MeshUpstream.open`) and `requestsWaitMs`: for each protocol 3 browser it opens a requests-only session as the browser's access, holds the subscription's welcome until that session's requests arrive (at most 5 seconds) and sends them in it, passes `requested` and `decided` on, and sends the browser's `approve`, `reject` and `withdraw` to it. Test: `src/mesh/clientServer.test.ts`.
 - **Writes carry their access to the owner, which may keep one as a request** (docs/design/statenet-requests.md, R1). Breaking: mesh protocol 4; a node of protocol 3 is refused, so every node of a statenet deploys together. A write forwarded between owner nodes keeps the writer's access (`OwnerMesh` passes it to `OwnerNode.write` and over a peer's link), and so do the writes queued in a handoff (`handoff.queued[].access`). A write's outcome may be `requested`: the owner's authority keeps the change for the owner to decide. A relay's browser server acks it `requested`. Tests: `src/mesh/groups.test.ts` ("requests across groups").
