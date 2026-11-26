@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- **A secret change is acked as `passed`**. The client server passes state-sync's new `passed` write outcome to the
+  browser as it is (`src/mesh/ClientServer.ts`). Covered by state-sync's `src/authority/Secret.test.ts`.
 - **Mesh protocol 5: links carry CBOR** (docs/design/statenet-wire-format.md, W3). Breaking: past the handshake, which
   stays JSON text, every link message is CBOR before it is sealed (`encodeLinkMessage`, `decodeLinkMessage`), and a
   node of protocol 4 is refused, so every node of a statenet deploys together. A `say` carries its sync message as

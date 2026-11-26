@@ -195,15 +195,20 @@ export async function startClientServer(options: ClientServerOptions): Promise<C
                 const written = address;
                 void options.write(address, change, access).then((outcome) => {
                     if (isReported(CATEGORY)) report(CATEGORY, 'A browser\'s change of %s at %s: %s', [written, change.path, outcome.result]);
-                    pass(
-                        outcome.result === 'rejected'
-                            ? { type: 'ack', id: change.id, result: 'rejected', reason: outcome.reason, ...(outcome.code === undefined ? {} : { code: outcome.code }) }
-                            : outcome.result === 'requested'
-                              ? { type: 'ack', id: change.id, result: 'requested' }
-                              : outcome.result === 'adjusted'
-                                ? { type: 'ack', id: change.id, result: 'adjusted', revision: outcome.revision, value: outcome.value ?? null }
-                                : { type: 'ack', id: change.id, result: 'applied', revision: outcome.revision }
-                    );
+                    switch (outcome.result) {
+                        case 'rejected':
+                            pass({ type: 'ack', id: change.id, result: 'rejected', reason: outcome.reason, ...(outcome.code === undefined ? {} : { code: outcome.code }) });
+                            return;
+                        case 'requested':
+                        case 'passed':
+                            pass({ type: 'ack', id: change.id, result: outcome.result });
+                            return;
+                        case 'adjusted':
+                            pass({ type: 'ack', id: change.id, result: 'adjusted', revision: outcome.revision, value: outcome.value ?? null });
+                            return;
+                        default:
+                            pass({ type: 'ack', id: change.id, result: 'applied', revision: outcome.revision });
+                    }
                 });
             }
         });
