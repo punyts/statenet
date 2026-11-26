@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- **Undo and redo reach the owner's authority.** The client server passes a browser's `undo` and `redo` through the
+  authority tunnel, as it does decisions (`src/mesh/ClientServer.ts`). The owner node makes its authorities without a
+  history yet, and a browser's change reaches them through `OwnerNode.write`, which keeps none, so an undo through a
+  relay finds nothing to undo until both do. Covered by state-sync's `src/authority/History.test.ts`.
 - **A secret change is acked as `passed`**. The client server passes state-sync's new `passed` write outcome to the
   browser as it is (`src/mesh/ClientServer.ts`). Covered by state-sync's `src/authority/Secret.test.ts`.
 - **Mesh protocol 5: links carry CBOR** (docs/design/statenet-wire-format.md, W3). Breaking: past the handshake, which

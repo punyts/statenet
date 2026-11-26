@@ -186,7 +186,8 @@ export async function startClientServer(options: ClientServerOptions): Promise<C
                 (renew as { unref?: () => void }).unref?.();
                 return;
             }
-            if ((message.type === 'approve' || message.type === 'reject' || message.type === 'withdraw') && tunnel !== undefined) {
+            // Decisions, undo and redo go to the authority itself, which checks the session's access
+            if ((message.type === 'approve' || message.type === 'reject' || message.type === 'withdraw' || message.type === 'undo' || message.type === 'redo') && tunnel !== undefined) {
                 tunnel.receive((tunnelWire as SyncWire).write(message));
                 return;
             }
